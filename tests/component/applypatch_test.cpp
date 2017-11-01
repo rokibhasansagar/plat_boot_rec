@@ -35,7 +35,7 @@
 #include "applypatch/applypatch.h"
 #include "applypatch/applypatch_modes.h"
 #include "common/test_constants.h"
-#include "print_sha1.h"
+#include "otautil/print_sha1.h"
 
 static void sha1sum(const std::string& fname, std::string* sha1, size_t* fsize = nullptr) {
   ASSERT_NE(nullptr, sha1);
@@ -59,14 +59,6 @@ static void mangle_file(const std::string& fname) {
     content[i] = rand() % 256;
   }
   ASSERT_TRUE(android::base::WriteStringToFile(content, fname));
-}
-
-static bool file_cmp(const std::string& f1, const std::string& f2) {
-  std::string c1;
-  android::base::ReadFileToString(f1, &c1);
-  std::string c2;
-  android::base::ReadFileToString(f2, &c2);
-  return c1 == c2;
 }
 
 class ApplyPatchTest : public ::testing::Test {
@@ -105,9 +97,6 @@ class ApplyPatchTest : public ::testing::Test {
   static size_t new_size;
 };
 
-std::string ApplyPatchTest::old_file;
-std::string ApplyPatchTest::new_file;
-
 static void cp(const std::string& src, const std::string& tgt) {
   std::string cmd = "cp " + src + " " + tgt;
   system(cmd.c_str());
@@ -132,48 +121,8 @@ class ApplyPatchCacheTest : public ApplyPatchTest {
   }
 };
 
-class ApplyPatchFullTest : public ApplyPatchCacheTest {
- public:
-  static void SetUpTestCase() {
-    ApplyPatchTest::SetUpTestCase();
-
-    output_f = new TemporaryFile();
-    output_loc = std::string(output_f->path);
-
-    struct FileContents fc;
-
-    ASSERT_EQ(0, LoadFileContents(&rand_file[0], &fc));
-    patches.push_back(
-        std::make_unique<Value>(VAL_BLOB, std::string(fc.data.begin(), fc.data.end())));
-
-    ASSERT_EQ(0, LoadFileContents(&patch_file[0], &fc));
-    patches.push_back(
-        std::make_unique<Value>(VAL_BLOB, std::string(fc.data.begin(), fc.data.end())));
-  }
-
-  static void TearDownTestCase() {
-    delete output_f;
-    patches.clear();
-  }
-
-  static std::vector<std::unique_ptr<Value>> patches;
-  static TemporaryFile* output_f;
-  static std::string output_loc;
-};
-
-class ApplyPatchDoubleCacheTest : public ApplyPatchFullTest {
- public:
-  virtual void SetUp() {
-    ApplyPatchCacheTest::SetUp();
-    cp(cache_file, "/cache/reallysaved.file");
-  }
-
-  virtual void TearDown() {
-    cp("/cache/reallysaved.file", cache_file);
-    ApplyPatchCacheTest::TearDown();
-  }
-};
-
+std::string ApplyPatchTest::old_file;
+std::string ApplyPatchTest::new_file;
 std::string ApplyPatchTest::rand_file;
 std::string ApplyPatchTest::patch_file;
 std::string ApplyPatchTest::cache_file;
@@ -183,10 +132,6 @@ std::string ApplyPatchTest::bad_sha1_a;
 std::string ApplyPatchTest::bad_sha1_b;
 size_t ApplyPatchTest::old_size;
 size_t ApplyPatchTest::new_size;
-
-std::vector<std::unique_ptr<Value>> ApplyPatchFullTest::patches;
-TemporaryFile* ApplyPatchFullTest::output_f;
-std::string ApplyPatchFullTest::output_loc;
 
 TEST_F(ApplyPatchTest, CheckModeSkip) {
   std::vector<std::string> sha1s;
@@ -280,136 +225,12 @@ TEST_F(ApplyPatchCacheTest, CheckCacheMissingFailure) {
   ASSERT_NE(0, applypatch_check(&old_file[0], sha1s));
 }
 
-TEST_F(ApplyPatchFullTest, ApplyInPlace) {
-  std::vector<std::string> sha1s = { bad_sha1_a, old_sha1 };
-  ASSERT_EQ(0, applypatch(&old_file[0], "-", &new_sha1[0], new_size, sha1s, patches, nullptr));
-  ASSERT_TRUE(file_cmp(old_file, new_file));
-
-  // reapply, applypatch is idempotent so it should succeed
-  ASSERT_EQ(0, applypatch(&old_file[0], "-", &new_sha1[0], new_size, sha1s, patches, nullptr));
-  ASSERT_TRUE(file_cmp(old_file, new_file));
-}
-
-TEST_F(ApplyPatchFullTest, ApplyInNewLocation) {
-  std::vector<std::string> sha1s = { bad_sha1_a, old_sha1 };
-  // Apply bsdiff patch to new location.
-  ASSERT_EQ(
-      0, applypatch(&old_file[0], &output_loc[0], &new_sha1[0], new_size, sha1s, patches, nullptr));
-  ASSERT_TRUE(file_cmp(output_loc, new_file));
-
-  // Reapply to the same location.
-  ASSERT_EQ(
-      0, applypatch(&old_file[0], &output_loc[0], &new_sha1[0], new_size, sha1s, patches, nullptr));
-  ASSERT_TRUE(file_cmp(output_loc, new_file));
-}
-
-TEST_F(ApplyPatchFullTest, ApplyCorruptedInNewLocation) {
-  std::vector<std::string> sha1s = { bad_sha1_a, old_sha1 };
-  // Apply bsdiff patch to new location with corrupted source.
-  mangle_file(old_file);
-  ASSERT_EQ(
-      0, applypatch(&old_file[0], &output_loc[0], &new_sha1[0], new_size, sha1s, patches, nullptr));
-  ASSERT_TRUE(file_cmp(output_loc, new_file));
-
-  // Reapply bsdiff patch to new location with corrupted source.
-  ASSERT_EQ(
-      0, applypatch(&old_file[0], &output_loc[0], &new_sha1[0], new_size, sha1s, patches, nullptr));
-  ASSERT_TRUE(file_cmp(output_loc, new_file));
-}
-
-TEST_F(ApplyPatchDoubleCacheTest, ApplyDoubleCorruptedInNewLocation) {
-  std::vector<std::string> sha1s = { bad_sha1_a, old_sha1 };
-
-  // Apply bsdiff patch to new location with corrupted source and copy (no new file).
-  // Expected to fail.
-  mangle_file(old_file);
-  mangle_file(cache_file);
-  ASSERT_NE(
-      0, applypatch(&old_file[0], &output_loc[0], &new_sha1[0], new_size, sha1s, patches, nullptr));
-  ASSERT_FALSE(file_cmp(output_loc, new_file));
-
-  // Expected to fail again on retry.
-  ASSERT_NE(
-      0, applypatch(&old_file[0], &output_loc[0], &new_sha1[0], new_size, sha1s, patches, nullptr));
-  ASSERT_FALSE(file_cmp(output_loc, new_file));
-
-  // Expected to fail with incorrect new file.
-  mangle_file(output_loc);
-  ASSERT_NE(
-      0, applypatch(&old_file[0], &output_loc[0], &new_sha1[0], new_size, sha1s, patches, nullptr));
-  ASSERT_FALSE(file_cmp(output_loc, new_file));
-}
-
 TEST(ApplyPatchModesTest, InvalidArgs) {
   // At least two args (including the filename).
   ASSERT_EQ(2, applypatch_modes(1, (const char* []){ "applypatch" }));
 
   // Unrecognized args.
   ASSERT_EQ(2, applypatch_modes(2, (const char* []){ "applypatch", "-x" }));
-}
-
-TEST(ApplyPatchModesTest, PatchMode) {
-  std::string boot_img = from_testdata_base("boot.img");
-  size_t boot_img_size;
-  std::string boot_img_sha1;
-  sha1sum(boot_img, &boot_img_sha1, &boot_img_size);
-
-  std::string recovery_img = from_testdata_base("recovery.img");
-  std::string recovery_img_sha1;
-  size_t size;
-  sha1sum(recovery_img, &recovery_img_sha1, &size);
-  std::string recovery_img_size = std::to_string(size);
-  std::string bonus_file = from_testdata_base("bonus.file");
-
-  // applypatch -b <bonus-file> <src-file> <tgt-file> <tgt-sha1> <tgt-size> <src-sha1>:<patch>
-  TemporaryFile tmp1;
-  std::string patch = boot_img_sha1 + ":" + from_testdata_base("recovery-from-boot.p");
-  std::vector<const char*> args = {
-    "applypatch",
-    "-b",
-    bonus_file.c_str(),
-    boot_img.c_str(),
-    tmp1.path,
-    recovery_img_sha1.c_str(),
-    recovery_img_size.c_str(),
-    patch.c_str()
-  };
-  ASSERT_EQ(0, applypatch_modes(args.size(), args.data()));
-
-  // applypatch <src-file> <tgt-file> <tgt-sha1> <tgt-size> <src-sha1>:<patch>
-  TemporaryFile tmp2;
-  patch = boot_img_sha1 + ":" + from_testdata_base("recovery-from-boot-with-bonus.p");
-  std::vector<const char*> args2 = {
-    "applypatch",
-    boot_img.c_str(),
-    tmp2.path,
-    recovery_img_sha1.c_str(),
-    recovery_img_size.c_str(),
-    patch.c_str()
-  };
-  ASSERT_EQ(0, applypatch_modes(args2.size(), args2.data()));
-
-  // applypatch -b <bonus-file> <src-file> <tgt-file> <tgt-sha1> <tgt-size> \
-  //               <src-sha1-fake>:<patch1> <src-sha1>:<patch2>
-  TemporaryFile tmp3;
-  std::string bad_sha1_a = android::base::StringPrintf("%040x", rand());
-  std::string bad_sha1_b = android::base::StringPrintf("%040x", rand());
-  std::string patch1 = bad_sha1_a + ":" + from_testdata_base("recovery-from-boot.p");
-  std::string patch2 = boot_img_sha1 + ":" + from_testdata_base("recovery-from-boot.p");
-  std::string patch3 = bad_sha1_b + ":" + from_testdata_base("recovery-from-boot.p");
-  std::vector<const char*> args3 = {
-    "applypatch",
-    "-b",
-    bonus_file.c_str(),
-    boot_img.c_str(),
-    tmp3.path,
-    recovery_img_sha1.c_str(),
-    recovery_img_size.c_str(),
-    patch1.c_str(),
-    patch2.c_str(),
-    patch3.c_str()
-  };
-  ASSERT_EQ(0, applypatch_modes(args3.size(), args3.data()));
 }
 
 TEST(ApplyPatchModesTest, PatchModeEmmcTarget) {
@@ -546,20 +367,6 @@ TEST(ApplyPatchModesTest, PatchModeInvalidArgs) {
 TEST(ApplyPatchModesTest, CheckModeInvalidArgs) {
   // Insufficient args.
   ASSERT_EQ(2, applypatch_modes(2, (const char* []){ "applypatch", "-c" }));
-}
-
-TEST(ApplyPatchModesTest, SpaceModeInvalidArgs) {
-  // Insufficient args.
-  ASSERT_EQ(2, applypatch_modes(2, (const char* []){ "applypatch", "-s" }));
-
-  // Invalid bytes arg.
-  ASSERT_EQ(1, applypatch_modes(3, (const char* []){ "applypatch", "-s", "x" }));
-
-  // 0 is invalid.
-  ASSERT_EQ(1, applypatch_modes(3, (const char* []){ "applypatch", "-s", "0" }));
-
-  // 0x10 is fine.
-  ASSERT_EQ(0, applypatch_modes(3, (const char* []){ "applypatch", "-s", "0x10" }));
 }
 
 TEST(ApplyPatchModesTest, ShowLicenses) {

@@ -116,7 +116,7 @@
 #include <cutils/sockets.h>
 #include <fs_mgr.h>
 
-#include "error_code.h"
+#include "otautil/error_code.h"
 
 static constexpr int WINDOW_SIZE = 5;
 static constexpr int FIBMAP_RETRY_LIMIT = 3;
@@ -163,20 +163,9 @@ static void add_block_to_ranges(std::vector<int>& ranges, int new_block) {
 }
 
 static struct fstab* read_fstab() {
-    fstab = NULL;
-
-    // The fstab path is always "/fstab.${ro.hardware}".
-    std::string ro_hardware = android::base::GetProperty("ro.hardware", "");
-    if (ro_hardware.empty()) {
-        LOG(ERROR) << "failed to get ro.hardware";
-        return NULL;
-    }
-
-    std::string fstab_path = "/fstab." + ro_hardware;
-
-    fstab = fs_mgr_read_fstab(fstab_path.c_str());
+    fstab = fs_mgr_read_fstab_default();
     if (!fstab) {
-        LOG(ERROR) << "failed to read " << fstab_path;
+        LOG(ERROR) << "failed to read default fstab";
         return NULL;
     }
 
@@ -459,20 +448,20 @@ static int produce_block_map(const char* path, const char* map_file, const char*
 static int uncrypt(const char* input_path, const char* map_file, const int socket) {
     LOG(INFO) << "update package is \"" << input_path << "\"";
 
-    // Turn the name of the file we're supposed to convert into an
-    // absolute path, so we can find what filesystem it's on.
+    // Turn the name of the file we're supposed to convert into an absolute path, so we can find
+    // what filesystem it's on.
     char path[PATH_MAX+1];
-    if (realpath(input_path, path) == NULL) {
+    if (realpath(input_path, path) == nullptr) {
         PLOG(ERROR) << "failed to convert \"" << input_path << "\" to absolute path";
-        return 1;
+        return kUncryptRealpathFindError;
     }
 
     bool encryptable;
     bool encrypted;
     const char* blk_dev = find_block_device(path, &encryptable, &encrypted);
-    if (blk_dev == NULL) {
+    if (blk_dev == nullptr) {
         LOG(ERROR) << "failed to find block device for " << path;
-        return 1;
+        return kUncryptBlockDeviceFindError;
     }
 
     // If the filesystem it's on isn't encrypted, we only produce the
@@ -636,12 +625,12 @@ int main(int argc, char** argv) {
     }
 
     if (action == UNCRYPT_DEBUG) {
-        LOG(INFO) << "uncrypt called in debug mode, skip socket communication\n";
+        LOG(INFO) << "uncrypt called in debug mode, skip socket communication";
         bool success = uncrypt_wrapper(input_path, map_file, -1);
         if (success) {
-            LOG(INFO) << "uncrypt succeeded\n";
+            LOG(INFO) << "uncrypt succeeded";
         } else{
-            LOG(INFO) << "uncrypt failed\n";
+            LOG(INFO) << "uncrypt failed";
         }
         return success ? 0 : 1;
     }

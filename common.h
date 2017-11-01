@@ -20,8 +20,11 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-#define STRINGIFY(x) #x
-#define EXPAND(x) STRINGIFY(x)
+#include <string>
+
+// Not using the command-line defined macro here because this header could be included by
+// device-specific recovery libraries. We static assert the value consistency in recovery.cpp.
+static constexpr int kRecoveryApiVersion = 3;
 
 class RecoveryUI;
 
@@ -29,7 +32,7 @@ extern RecoveryUI* ui;
 extern bool modified_flash;
 
 // The current stage, e.g. "1/2".
-extern const char* stage;
+extern std::string stage;
 
 // The reason argument provided in "--reason=".
 extern const char* reason;
@@ -40,5 +43,7 @@ FILE* fopen_path(const char *path, const char *mode);
 void ui_print(const char* format, ...);
 
 bool is_ro_debuggable();
+
+bool reboot(const std::string& command);
 
 #endif  // RECOVERY_COMMON_H

@@ -29,27 +29,14 @@
 #include <android-base/unique_fd.h>
 #include <fs_mgr.h>
 
-static struct fstab* read_fstab(std::string* err) {
-  std::string ro_hardware = android::base::GetProperty("ro.hardware", "");
-  if (ro_hardware.empty()) {
-    *err = "failed to get ro.hardware";
-    return nullptr;
-  }
-  // The fstab path is always "/fstab.${ro.hardware}".
-  std::string fstab_path = "/fstab." + ro_hardware;
-  struct fstab* fstab = fs_mgr_read_fstab(fstab_path.c_str());
-  if (fstab == nullptr) {
-    *err = "failed to read " + fstab_path;
-  }
-  return fstab;
-}
-
 static std::string get_misc_blk_device(std::string* err) {
-  struct fstab* fstab = read_fstab(err);
-  if (fstab == nullptr) {
+  std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)> fstab(fs_mgr_read_fstab_default(),
+                                                             fs_mgr_free_fstab);
+  if (!fstab) {
+    *err = "failed to read default fstab";
     return "";
   }
-  fstab_rec* record = fs_mgr_get_entry_for_mount_point(fstab, "/misc");
+  fstab_rec* record = fs_mgr_get_entry_for_mount_point(fstab.get(), "/misc");
   if (record == nullptr) {
     *err = "failed to find /misc partition";
     return "";
@@ -128,6 +115,13 @@ static bool write_misc_partition(const void* p, size_t size, const std::string& 
     return false;
   }
   return true;
+}
+
+std::string get_bootloader_message_blk_device(std::string* err) {
+  std::string misc_blk_device = get_misc_blk_device(err);
+  if (misc_blk_device.empty()) return "";
+  if (!wait_for_device(misc_blk_device, err)) return "";
+  return misc_blk_device;
 }
 
 bool read_bootloader_message_from(bootloader_message* boot, const std::string& misc_blk_device,

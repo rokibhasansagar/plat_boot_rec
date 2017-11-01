@@ -75,16 +75,13 @@ on late-init
     trigger early-boot
     trigger boot
 
-on property:sys.powerctl=*
-   powerctl ${sys.powerctl}
-
 service ueventd /sbin/ueventd
     critical
     seclabel u:r:ueventd:s0
 
-service healthd /sbin/healthd -r
+service charger /charger -r
     critical
-    seclabel u:r:healthd:s0
+    seclabel u:r:charger:s0
 
 service recovery /sbin/recovery
     seclabel u:r:recovery:s0
