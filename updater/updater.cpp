@@ -25,14 +25,16 @@
 
 #include <android-base/logging.h>
 #include <android-base/strings.h>
+#include <selinux/android.h>
 #include <selinux/label.h>
 #include <selinux/selinux.h>
 #include <ziparchive/zip_archive.h>
 
-#include "config.h"
 #include "edify/expr.h"
+#include "otafault/config.h"
 #include "otautil/DirUtil.h"
 #include "otautil/SysUtil.h"
+#include "otautil/error_code.h"
 #include "updater/blockimg.h"
 #include "updater/install.h"
 
@@ -89,7 +91,7 @@ int main(int argc, char** argv) {
 
   const char* package_filename = argv[3];
   MemMapping map;
-  if (sysMapFile(package_filename, &map) != 0) {
+  if (!map.MapFile(package_filename)) {
     LOG(ERROR) << "failed to map package " << argv[3];
     return 3;
   }
@@ -130,7 +132,7 @@ int main(int argc, char** argv) {
 
   // Parse the script.
 
-  Expr* root;
+  std::unique_ptr<Expr> root;
   int error_count = 0;
   int error = parse_string(script.c_str(), &root, &error_count);
   if (error != 0 || error_count > 0) {
@@ -139,9 +141,8 @@ int main(int argc, char** argv) {
     return 6;
   }
 
-  struct selinux_opt seopts[] = { { SELABEL_OPT_PATH, "/file_contexts" } };
-
-  sehandle = selabel_open(SELABEL_CTX_FILE, seopts, 1);
+  sehandle = selinux_android_file_context_handle();
+  selinux_android_set_sehandle(sehandle);
 
   if (!sehandle) {
     fprintf(cmd_pipe, "ui_print Warning: No file_contexts\n");
@@ -185,21 +186,26 @@ int main(int argc, char** argv) {
         // Parse the error code in abort message.
         // Example: "E30: This package is for bullhead devices."
         if (!line.empty() && line[0] == 'E') {
-          if (sscanf(line.c_str(), "E%u: ", &state.error_code) != 1) {
+          if (sscanf(line.c_str(), "E%d: ", &state.error_code) != 1) {
             LOG(ERROR) << "Failed to parse error code: [" << line << "]";
           }
         }
         fprintf(cmd_pipe, "ui_print %s\n", line.c_str());
       }
-      fprintf(cmd_pipe, "ui_print\n");
     }
 
-    if (state.error_code != kNoError) {
-      fprintf(cmd_pipe, "log error: %d\n", state.error_code);
-      // Cause code should provide additional information about the abort;
-      // report only when an error exists.
-      if (state.cause_code != kNoCause) {
-        fprintf(cmd_pipe, "log cause: %d\n", state.cause_code);
+    // Installation has been aborted. Set the error code to kScriptExecutionFailure unless
+    // a more specific code has been set in errmsg.
+    if (state.error_code == kNoError) {
+      state.error_code = kScriptExecutionFailure;
+    }
+    fprintf(cmd_pipe, "log error: %d\n", state.error_code);
+    // Cause code should provide additional information about the abort.
+    if (state.cause_code != kNoCause) {
+      fprintf(cmd_pipe, "log cause: %d\n", state.cause_code);
+      if (state.cause_code == kPatchApplicationFailure) {
+        LOG(INFO) << "Patch application failed, retry update.";
+        fprintf(cmd_pipe, "retry_update\n");
       }
     }
 
@@ -214,7 +220,6 @@ int main(int argc, char** argv) {
   if (updater_info.package_zip) {
     CloseArchive(updater_info.package_zip);
   }
-  sysReleaseMap(&map);
 
   return 0;
 }
