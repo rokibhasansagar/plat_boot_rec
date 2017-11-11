@@ -158,7 +158,6 @@ LOCAL_STATIC_LIBRARIES := \
     libziparchive \
     libotautil \
     libmounts \
-    libz \
     libminadbd \
     libasyncio \
     libfusesideload \
@@ -173,7 +172,8 @@ LOCAL_STATIC_LIBRARIES := \
     libcutils \
     libutils \
     liblog \
-    libselinux
+    libselinux \
+    libz
 
 LOCAL_HAL_STATIC_LIBRARIES := libhealthd
 
@@ -263,6 +263,5 @@ include \
     $(LOCAL_PATH)/minui/Android.mk \
     $(LOCAL_PATH)/tests/Android.mk \
     $(LOCAL_PATH)/tools/Android.mk \
-    $(LOCAL_PATH)/uncrypt/Android.mk \
     $(LOCAL_PATH)/updater/Android.mk \
     $(LOCAL_PATH)/update_verifier/Android.mk \

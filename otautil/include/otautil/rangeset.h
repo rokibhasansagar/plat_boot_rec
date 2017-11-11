@@ -30,28 +30,43 @@ class RangeSet {
 
   explicit RangeSet(std::vector<Range>&& pairs);
 
+  // Parses the given string into a RangeSet. Returns the parsed RangeSet, or an empty RangeSet on
+  // errors.
   static RangeSet Parse(const std::string& range_text);
+
+  // Appends the given Range to the current RangeSet.
+  bool PushBack(Range range);
+
+  // Clears all the ranges from the RangeSet.
+  void Clear();
 
   std::string ToString() const;
 
-  // Get the block number for the i-th (starting from 0) block in the RangeSet.
+  // Gets the block number for the i-th (starting from 0) block in the RangeSet.
   size_t GetBlockNumber(size_t idx) const;
 
-  // RangeSet has half-closed half-open bounds. For example, "3,5" contains blocks 3 and 4. So "3,5"
-  // and "5,7" are not overlapped.
+  // Returns whether the current RangeSet overlaps with other. RangeSet has half-closed half-open
+  // bounds. For example, "3,5" contains blocks 3 and 4. So "3,5" and "5,7" are not overlapped.
   bool Overlaps(const RangeSet& other) const;
 
-  // size() gives the number of Range's in this RangeSet.
+  // Returns a vector of RangeSets that contain the same set of blocks represented by the current
+  // RangeSet. The RangeSets in the vector contain similar number of blocks, with a maximum delta
+  // of 1-block between any two of them. For example, 14 blocks would be split into 4 + 4 + 3 + 3,
+  // as opposed to 4 + 4 + 4 + 2. If the total number of blocks (T) is less than groups, it
+  // returns a vector of T 1-block RangeSets. Otherwise the number of the returned RangeSets must
+  // equal to groups. The current RangeSet remains intact after the split.
+  std::vector<RangeSet> Split(size_t groups) const;
+
+  // Returns the number of Range's in this RangeSet.
   size_t size() const {
     return ranges_.size();
   }
 
-  // blocks() gives the number of all blocks in this RangeSet.
+  // Returns the total number of blocks in this RangeSet.
   size_t blocks() const {
     return blocks_;
   }
 
-  // We provide const iterators only.
   std::vector<Range>::const_iterator cbegin() const {
     return ranges_.cbegin();
   }
@@ -60,13 +75,20 @@ class RangeSet {
     return ranges_.cend();
   }
 
-  // Need to provide begin()/end() since range-based loop expects begin()/end().
+  std::vector<Range>::iterator begin() {
+    return ranges_.begin();
+  }
+
+  std::vector<Range>::iterator end() {
+    return ranges_.end();
+  }
+
   std::vector<Range>::const_iterator begin() const {
-    return ranges_.cbegin();
+    return ranges_.begin();
   }
 
   std::vector<Range>::const_iterator end() const {
-    return ranges_.cend();
+    return ranges_.end();
   }
 
   // Reverse const iterators for MoveRange().
@@ -76,6 +98,11 @@ class RangeSet {
 
   std::vector<Range>::const_reverse_iterator crend() const {
     return ranges_.crend();
+  }
+
+  // Returns whether the RangeSet is valid (i.e. non-empty).
+  explicit operator bool() const {
+    return !ranges_.empty();
   }
 
   const Range& operator[](size_t i) const {
@@ -109,6 +136,9 @@ class RangeSet {
 // every block in the original source.
 class SortedRangeSet : public RangeSet {
  public:
+  // The block size when working with offset and file length.
+  static constexpr size_t kBlockSize = 4096;
+
   SortedRangeSet() {}
 
   // Ranges in the the set should be mutually exclusive; and they're sorted by the start block.
@@ -121,8 +151,6 @@ class SortedRangeSet : public RangeSet {
 
   // Compute the block range the file occupies, and insert that range.
   void Insert(size_t start, size_t len);
-
-  void Clear();
 
   using RangeSet::Overlaps;
 

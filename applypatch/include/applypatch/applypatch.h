@@ -36,16 +36,16 @@ struct FileContents {
   struct stat st;
 };
 
-// When there isn't enough room on the target filesystem to hold the
-// patched version of the file, we copy the original here and delete
-// it to free up space.  If the expected source file doesn't exist, or
-// is corrupted, we look to see if this file contains the bits we want
-// and use it as the source instead.
-#define CACHE_TEMP_SOURCE "/cache/saved.file"
+// When there isn't enough room on the target filesystem to hold the patched version of the file,
+// we copy the original here and delete it to free up space.  If the expected source file doesn't
+// exist, or is corrupted, we look to see if the cached file contains the bits we want and use it as
+// the source instead.  The default location for the cached source is "/cache/saved.file".
+extern std::string cache_temp_source;
 
 using SinkFn = std::function<size_t(const unsigned char*, size_t)>;
 
 // applypatch.cpp
+
 int ShowLicenses();
 size_t FreeSpaceForFile(const char* filename);
 int CacheSizeCheck(size_t bytes);
@@ -67,15 +67,25 @@ int LoadFileContents(const char* filename, FileContents* file);
 int SaveFileContents(const char* filename, const FileContents* file);
 
 // bspatch.cpp
+
 void ShowBSDiffLicense();
-int ApplyBSDiffPatch(const unsigned char* old_data, size_t old_size, const Value* patch,
+
+// Applies the bsdiff-patch given in 'patch' (from offset 'patch_offset' to the end) to the source
+// data given by (old_data, old_size). Writes the patched output through the given 'sink', and
+// updates the SHA-1 context with the output data. Returns 0 on success.
+int ApplyBSDiffPatch(const unsigned char* old_data, size_t old_size, const Value& patch,
                      size_t patch_offset, SinkFn sink, SHA_CTX* ctx);
 
 // imgpatch.cpp
-int ApplyImagePatch(const unsigned char* old_data, size_t old_size, const Value* patch, SinkFn sink,
+
+// Applies the imgdiff-patch given in 'patch' to the source data given by (old_data, old_size), with
+// the optional bonus data. Writes the patched output through the given 'sink', and updates the
+// SHA-1 context with the output data. Returns 0 on success.
+int ApplyImagePatch(const unsigned char* old_data, size_t old_size, const Value& patch, SinkFn sink,
                     SHA_CTX* ctx, const Value* bonus_data);
 
 // freecache.cpp
+
 int MakeFreeSpaceOnCache(size_t bytes_needed);
 
 #endif
