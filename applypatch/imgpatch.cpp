@@ -38,6 +38,7 @@
 #include <zlib.h>
 
 #include "edify/expr.h"
+#include "otautil/print_sha1.h"
 
 static inline int64_t Read8(const void *address) {
   return android::base::get_unaligned<int64_t>(address);
@@ -51,13 +52,18 @@ static inline int32_t Read4(const void *address) {
 // patched data and stream the deflated data to output.
 static bool ApplyBSDiffPatchAndStreamOutput(const uint8_t* src_data, size_t src_len,
                                             const Value& patch, size_t patch_offset,
-                                            const char* deflate_header, SinkFn sink, SHA_CTX* ctx) {
+                                            const char* deflate_header, SinkFn sink) {
   size_t expected_target_length = static_cast<size_t>(Read8(deflate_header + 32));
   int level = Read4(deflate_header + 40);
   int method = Read4(deflate_header + 44);
   int window_bits = Read4(deflate_header + 48);
   int mem_level = Read4(deflate_header + 52);
   int strategy = Read4(deflate_header + 56);
+
+  // TODO(b/67849209) Remove after debugging the unit test flakiness.
+  if (android::base::GetMinimumLogSeverity() <= android::base::LogSeverity::DEBUG) {
+    LOG(DEBUG) << "zlib version " << zlibVersion();
+  }
 
   z_stream strm;
   strm.zalloc = Z_NULL;
@@ -76,8 +82,10 @@ static bool ApplyBSDiffPatchAndStreamOutput(const uint8_t* src_data, size_t src_
   size_t actual_target_length = 0;
   size_t total_written = 0;
   static constexpr size_t buffer_size = 32768;
+  SHA_CTX sha_ctx;
+  SHA1_Init(&sha_ctx);
   auto compression_sink = [&strm, &actual_target_length, &expected_target_length, &total_written,
-                           &ret, &ctx, &sink](const uint8_t* data, size_t len) -> size_t {
+                           &ret, &sink, &sha_ctx](const uint8_t* data, size_t len) -> size_t {
     // The input patch length for an update never exceeds INT_MAX.
     strm.avail_in = len;
     strm.next_in = data;
@@ -102,17 +110,25 @@ static bool ApplyBSDiffPatchAndStreamOutput(const uint8_t* src_data, size_t src_
         LOG(ERROR) << "Failed to write " << have << " compressed bytes to output.";
         return 0;
       }
-      if (ctx) SHA1_Update(ctx, buffer.data(), have);
     } while ((strm.avail_in != 0 || strm.avail_out == 0) && ret != Z_STREAM_END);
+
+    // TODO(b/67849209) Remove after debugging the unit test flakiness.
+    if (android::base::GetMinimumLogSeverity() <= android::base::LogSeverity::DEBUG) {
+      SHA1_Update(&sha_ctx, data, len);
+    }
 
     actual_target_length += len;
     return len;
   };
 
-  int bspatch_result =
-      ApplyBSDiffPatch(src_data, src_len, patch, patch_offset, compression_sink, nullptr);
+  int bspatch_result = ApplyBSDiffPatch(src_data, src_len, patch, patch_offset, compression_sink);
   deflateEnd(&strm);
 
+  if (android::base::GetMinimumLogSeverity() <= android::base::LogSeverity::DEBUG) {
+    uint8_t digest[SHA_DIGEST_LENGTH];
+    SHA1_Final(digest, &sha_ctx);
+    LOG(DEBUG) << "sha1 of " << actual_target_length << " bytes input data: " << short_sha1(digest);
+  }
   if (bspatch_result != 0) {
     return false;
   }
@@ -135,11 +151,11 @@ static bool ApplyBSDiffPatchAndStreamOutput(const uint8_t* src_data, size_t src_
 int ApplyImagePatch(const unsigned char* old_data, size_t old_size, const unsigned char* patch_data,
                     size_t patch_size, SinkFn sink) {
   Value patch(VAL_BLOB, std::string(reinterpret_cast<const char*>(patch_data), patch_size));
-  return ApplyImagePatch(old_data, old_size, patch, sink, nullptr, nullptr);
+  return ApplyImagePatch(old_data, old_size, patch, sink, nullptr);
 }
 
 int ApplyImagePatch(const unsigned char* old_data, size_t old_size, const Value& patch, SinkFn sink,
-                    SHA_CTX* ctx, const Value* bonus_data) {
+                    const Value* bonus_data) {
   if (patch.data.size() < 12) {
     printf("patch too short to contain header\n");
     return -1;
@@ -180,10 +196,12 @@ int ApplyImagePatch(const unsigned char* old_data, size_t old_size, const Value&
         printf("source data too short\n");
         return -1;
       }
-      if (ApplyBSDiffPatch(old_data + src_start, src_len, patch, patch_offset, sink, ctx) != 0) {
+      if (ApplyBSDiffPatch(old_data + src_start, src_len, patch, patch_offset, sink) != 0) {
         printf("Failed to apply bsdiff patch.\n");
         return -1;
       }
+
+      LOG(DEBUG) << "Processed chunk type normal";
     } else if (type == CHUNK_RAW) {
       const char* raw_header = patch_header + pos;
       pos += 4;
@@ -198,14 +216,13 @@ int ApplyImagePatch(const unsigned char* old_data, size_t old_size, const Value&
         printf("failed to read chunk %d raw data\n", i);
         return -1;
       }
-      if (ctx) {
-        SHA1_Update(ctx, patch_header + pos, data_len);
-      }
       if (sink(reinterpret_cast<const unsigned char*>(patch_header + pos), data_len) != data_len) {
         printf("failed to write chunk %d raw data\n", i);
         return -1;
       }
       pos += data_len;
+
+      LOG(DEBUG) << "Processed chunk type raw";
     } else if (type == CHUNK_DEFLATE) {
       // deflate chunks have an additional 60 bytes in their chunk header.
       const char* deflate_header = patch_header + pos;
@@ -276,11 +293,12 @@ int ApplyImagePatch(const unsigned char* old_data, size_t old_size, const Value&
       }
 
       if (!ApplyBSDiffPatchAndStreamOutput(expanded_source.data(), expanded_len, patch,
-                                           patch_offset, deflate_header, sink, ctx)) {
+                                           patch_offset, deflate_header, sink)) {
         LOG(ERROR) << "Fail to apply streaming bspatch.";
         return -1;
       }
 
+      LOG(DEBUG) << "Processed chunk type deflate";
     } else {
       printf("patch chunk %d is unknown type %d\n", i, type);
       return -1;

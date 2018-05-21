@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2007 The Android Open Source Project
+ * Copyright (C) 2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,11 @@
  * limitations under the License.
  */
 
-#ifndef MOUNTS_H_
-#define MOUNTS_H_
+#pragma once
 
-struct MountedVolume;
+#include <string>
+#include <vector>
 
-bool scan_mounted_volumes();
+#include "device.h"
 
-MountedVolume* find_mounted_volume_by_mount_point(const char* mount_point);
-
-int unmount_mounted_volume(MountedVolume* volume);
-
-#endif
+Device::BuiltinAction start_recovery(Device* device, const std::vector<std::string>& args);

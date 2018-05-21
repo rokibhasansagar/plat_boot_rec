@@ -17,6 +17,8 @@
 #include <string>
 
 #include <android-base/file.h>
+#include <android-base/properties.h>
+#include <android-base/strings.h>
 #include <android-base/test_utils.h>
 #include <gtest/gtest.h>
 #include <update_verifier/update_verifier.h>
@@ -24,11 +26,8 @@
 class UpdateVerifierTest : public ::testing::Test {
  protected:
   void SetUp() override {
-#if defined(PRODUCT_SUPPORTS_VERITY) || defined(BOARD_AVB_ENABLE)
-    verity_supported = true;
-#else
-    verity_supported = false;
-#endif
+    std::string verity_mode = android::base::GetProperty("ro.boot.veritymode", "");
+    verity_supported = android::base::EqualsIgnoreCase(verity_mode, "enforcing");
   }
 
   bool verity_supported;
@@ -46,7 +45,6 @@ TEST_F(UpdateVerifierTest, verify_image_smoke) {
     return;
   }
 
-  // The care map file can have only two or four lines.
   TemporaryFile temp_file;
   std::string content = "system\n2,0,1";
   ASSERT_TRUE(android::base::WriteStringToFile(content, temp_file.path));
@@ -58,7 +56,7 @@ TEST_F(UpdateVerifierTest, verify_image_smoke) {
 }
 
 TEST_F(UpdateVerifierTest, verify_image_wrong_lines) {
-  // The care map file can have only two or four lines.
+  // The care map file can have only 2 / 4 / 6 lines.
   TemporaryFile temp_file;
   ASSERT_FALSE(verify_image(temp_file.path));
 

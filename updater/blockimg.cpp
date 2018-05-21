@@ -15,8 +15,8 @@
  */
 
 #include <ctype.h>
-#include <errno.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/fs.h>
@@ -25,26 +25,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
-#include <fec/io.h>
 
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <applypatch/applypatch.h>
 #include <brotli/decode.h>
+#include <fec/io.h>
 #include <openssl/sha.h>
 #include <private/android_filesystem_config.h>
 #include <ziparchive/zip_archive.h>
@@ -52,6 +54,7 @@
 #include "edify/expr.h"
 #include "otafault/ota_io.h"
 #include "otautil/error_code.h"
+#include "otautil/paths.h"
 #include "otautil/print_sha1.h"
 #include "otautil/rangeset.h"
 #include "updater/install.h"
@@ -63,13 +66,117 @@
 #define DEBUG_ERASE  0
 
 static constexpr size_t BLOCKSIZE = 4096;
-static constexpr const char* STASH_DIRECTORY_BASE = "/cache/recovery";
 static constexpr mode_t STASH_DIRECTORY_MODE = 0700;
 static constexpr mode_t STASH_FILE_MODE = 0600;
 
 static CauseCode failure_type = kNoCause;
 static bool is_retry = false;
 static std::unordered_map<std::string, RangeSet> stash_map;
+
+static void DeleteLastCommandFile() {
+  const std::string& last_command_file = Paths::Get().last_command_file();
+  if (unlink(last_command_file.c_str()) == -1 && errno != ENOENT) {
+    PLOG(ERROR) << "Failed to unlink: " << last_command_file;
+  }
+}
+
+// Parse the last command index of the last update and save the result to |last_command_index|.
+// Return true if we successfully read the index.
+static bool ParseLastCommandFile(int* last_command_index) {
+  const std::string& last_command_file = Paths::Get().last_command_file();
+  android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(last_command_file.c_str(), O_RDONLY)));
+  if (fd == -1) {
+    if (errno != ENOENT) {
+      PLOG(ERROR) << "Failed to open " << last_command_file;
+      return false;
+    }
+
+    LOG(INFO) << last_command_file << " doesn't exist.";
+    return false;
+  }
+
+  // Now that the last_command file exists, parse the last command index of previous update.
+  std::string content;
+  if (!android::base::ReadFdToString(fd.get(), &content)) {
+    LOG(ERROR) << "Failed to read: " << last_command_file;
+    return false;
+  }
+
+  std::vector<std::string> lines = android::base::Split(android::base::Trim(content), "\n");
+  if (lines.size() != 2) {
+    LOG(ERROR) << "Unexpected line counts in last command file: " << content;
+    return false;
+  }
+
+  if (!android::base::ParseInt(lines[0], last_command_index)) {
+    LOG(ERROR) << "Failed to parse integer in: " << lines[0];
+    return false;
+  }
+
+  return true;
+}
+
+static bool FsyncDir(const std::string& dirname) {
+  android::base::unique_fd dfd(
+      TEMP_FAILURE_RETRY(ota_open(dirname.c_str(), O_RDONLY | O_DIRECTORY)));
+  if (dfd == -1) {
+    failure_type = kFileOpenFailure;
+    PLOG(ERROR) << "Failed to open " << dirname;
+    return false;
+  }
+  if (fsync(dfd) == -1) {
+    failure_type = kFsyncFailure;
+    PLOG(ERROR) << "Failed to fsync " << dirname;
+    return false;
+  }
+  return true;
+}
+
+// Update the last executed command index in the last_command_file.
+static bool UpdateLastCommandIndex(int command_index, const std::string& command_string) {
+  const std::string& last_command_file = Paths::Get().last_command_file();
+  std::string last_command_tmp = last_command_file + ".tmp";
+  std::string content = std::to_string(command_index) + "\n" + command_string;
+  android::base::unique_fd wfd(
+      TEMP_FAILURE_RETRY(open(last_command_tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0660)));
+  if (wfd == -1 || !android::base::WriteStringToFd(content, wfd)) {
+    PLOG(ERROR) << "Failed to update last command";
+    return false;
+  }
+
+  if (fsync(wfd) == -1) {
+    PLOG(ERROR) << "Failed to fsync " << last_command_tmp;
+    return false;
+  }
+
+  if (chown(last_command_tmp.c_str(), AID_SYSTEM, AID_SYSTEM) == -1) {
+    PLOG(ERROR) << "Failed to change owner for " << last_command_tmp;
+    return false;
+  }
+
+  if (rename(last_command_tmp.c_str(), last_command_file.c_str()) == -1) {
+    PLOG(ERROR) << "Failed to rename" << last_command_tmp;
+    return false;
+  }
+
+  if (!FsyncDir(android::base::Dirname(last_command_file))) {
+    return false;
+  }
+
+  return true;
+}
+
+static bool SetPartitionUpdatedMarker(const std::string& marker) {
+  if (!android::base::WriteStringToFile("", marker)) {
+    PLOG(ERROR) << "Failed to write to marker file " << marker;
+    return false;
+  }
+  if (!FsyncDir(android::base::Dirname(marker))) {
+    return false;
+  }
+  LOG(INFO) << "Wrote partition updated marker to " << marker;
+  return true;
+}
 
 static int read_all(int fd, uint8_t* data, size_t size) {
     size_t so_far = 0;
@@ -439,6 +546,7 @@ static int WriteBlocks(const RangeSet& tgt, const std::vector<uint8_t>& buffer, 
 struct CommandParameters {
     std::vector<std::string> tokens;
     size_t cpos;
+    int cmdindex;
     const char* cmdname;
     const char* cmdline;
     std::string freestash;
@@ -455,6 +563,7 @@ struct CommandParameters {
     pthread_t thread;
     std::vector<uint8_t> buffer;
     uint8_t* patch_start;
+    bool target_verified;  // The target blocks have expected contents already.
 };
 
 // Print the hash in hex for corrupted source blocks (excluding the stashed blocks which is
@@ -581,15 +690,15 @@ static int VerifyBlocks(const std::string& expected, const std::vector<uint8_t>&
 }
 
 static std::string GetStashFileName(const std::string& base, const std::string& id,
-        const std::string& postfix) {
-    if (base.empty()) {
-        return "";
-    }
-
-    std::string fn(STASH_DIRECTORY_BASE);
-    fn += "/" + base + "/" + id + postfix;
-
-    return fn;
+                                    const std::string& postfix) {
+  if (base.empty()) {
+    return "";
+  }
+  std::string filename = Paths::Get().stash_directory_base() + "/" + base;
+  if (id.empty() && postfix.empty()) {
+    return filename;
+  }
+  return filename + "/" + id + postfix;
 }
 
 // Does a best effort enumeration of stash files. Ignores possible non-file items in the stash
@@ -777,18 +886,9 @@ static int WriteStash(const std::string& base, const std::string& id, int blocks
     }
 
     std::string dname = GetStashFileName(base, "", "");
-    android::base::unique_fd dfd(TEMP_FAILURE_RETRY(ota_open(dname.c_str(),
-                                                             O_RDONLY | O_DIRECTORY)));
-    if (dfd == -1) {
-        failure_type = kFileOpenFailure;
-        PLOG(ERROR) << "failed to open \"" << dname << "\" failed";
-        return -1;
-    }
-
-    if (ota_fsync(dfd) == -1) {
-        failure_type = kFsyncFailure;
-        PLOG(ERROR) << "fsync \"" << dname << "\" failed";
-        return -1;
+    if (!FsyncDir(dname)) {
+      failure_type = kFsyncFailure;
+      return -1;
     }
 
     return 0;
@@ -797,47 +897,35 @@ static int WriteStash(const std::string& base, const std::string& id, int blocks
 // Creates a directory for storing stash files and checks if the /cache partition
 // hash enough space for the expected amount of blocks we need to store. Returns
 // >0 if we created the directory, zero if it existed already, and <0 of failure.
-
-static int CreateStash(State* state, size_t maxblocks, const std::string& blockdev,
-                       std::string& base) {
-  if (blockdev.empty()) {
-    return -1;
-  }
-
-  // Stash directory should be different for each partition to avoid conflicts
-  // when updating multiple partitions at the same time, so we use the hash of
-  // the block device name as the base directory
-  uint8_t digest[SHA_DIGEST_LENGTH];
-  SHA1(reinterpret_cast<const uint8_t*>(blockdev.data()), blockdev.size(), digest);
-  base = print_sha1(digest);
-
+static int CreateStash(State* state, size_t maxblocks, const std::string& base) {
   std::string dirname = GetStashFileName(base, "", "");
   struct stat sb;
   int res = stat(dirname.c_str(), &sb);
-  size_t max_stash_size = maxblocks * BLOCKSIZE;
-
   if (res == -1 && errno != ENOENT) {
-    ErrorAbort(state, kStashCreationFailure, "stat \"%s\" failed: %s\n", dirname.c_str(),
+    ErrorAbort(state, kStashCreationFailure, "stat \"%s\" failed: %s", dirname.c_str(),
                strerror(errno));
     return -1;
-  } else if (res != 0) {
+  }
+
+  size_t max_stash_size = maxblocks * BLOCKSIZE;
+  if (res == -1) {
     LOG(INFO) << "creating stash " << dirname;
     res = mkdir(dirname.c_str(), STASH_DIRECTORY_MODE);
 
     if (res != 0) {
-      ErrorAbort(state, kStashCreationFailure, "mkdir \"%s\" failed: %s\n", dirname.c_str(),
+      ErrorAbort(state, kStashCreationFailure, "mkdir \"%s\" failed: %s", dirname.c_str(),
                  strerror(errno));
       return -1;
     }
 
     if (chown(dirname.c_str(), AID_SYSTEM, AID_SYSTEM) != 0) {  // system user
-      ErrorAbort(state, kStashCreationFailure, "chown \"%s\" failed: %s\n", dirname.c_str(),
+      ErrorAbort(state, kStashCreationFailure, "chown \"%s\" failed: %s", dirname.c_str(),
                  strerror(errno));
       return -1;
     }
 
     if (CacheSizeCheck(max_stash_size) != 0) {
-      ErrorAbort(state, kStashCreationFailure, "not enough space for stash (%zu needed)\n",
+      ErrorAbort(state, kStashCreationFailure, "not enough space for stash (%zu needed)",
                  max_stash_size);
       return -1;
     }
@@ -869,7 +957,7 @@ static int CreateStash(State* state, size_t maxblocks, const std::string& blockd
   if (max_stash_size > existing) {
     size_t needed = max_stash_size - existing;
     if (CacheSizeCheck(needed) != 0) {
-      ErrorAbort(state, kStashCreationFailure, "not enough space for stash (%zu more needed)\n",
+      ErrorAbort(state, kStashCreationFailure, "not enough space for stash (%zu more needed)",
                  needed);
       return -1;
     }
@@ -1112,8 +1200,11 @@ static int PerformCommandMove(CommandParameters& params) {
 
   if (status == 0) {
     params.foundwrites = true;
-  } else if (params.foundwrites) {
-    LOG(WARNING) << "warning: commands executed out of order [" << params.cmdname << "]";
+  } else {
+    params.target_verified = true;
+    if (params.foundwrites) {
+      LOG(WARNING) << "warning: commands executed out of order [" << params.cmdname << "]";
+    }
   }
 
   if (params.canwrite) {
@@ -1177,8 +1268,11 @@ static int PerformCommandStash(CommandParameters& params) {
   }
 
   LOG(INFO) << "stashing " << blocks << " blocks to " << id;
-  params.stashed += blocks;
-  return WriteStash(params.stashbase, id, blocks, params.buffer, false, nullptr);
+  int result = WriteStash(params.stashbase, id, blocks, params.buffer, false, nullptr);
+  if (result == 0) {
+    params.stashed += blocks;
+  }
+  return result;
 }
 
 static int PerformCommandFree(CommandParameters& params) {
@@ -1306,8 +1400,11 @@ static int PerformCommandDiff(CommandParameters& params) {
 
   if (status == 0) {
     params.foundwrites = true;
-  } else if (params.foundwrites) {
-    LOG(WARNING) << "warning: commands executed out of order [" << params.cmdname << "]";
+  } else {
+    params.target_verified = true;
+    if (params.foundwrites) {
+      LOG(WARNING) << "warning: commands executed out of order [" << params.cmdname << "]";
+    }
   }
 
   if (params.canwrite) {
@@ -1321,7 +1418,7 @@ static int PerformCommandDiff(CommandParameters& params) {
         if (ApplyImagePatch(params.buffer.data(), blocks * BLOCKSIZE, patch_value,
                             std::bind(&RangeSinkWriter::Write, &writer, std::placeholders::_1,
                                       std::placeholders::_2),
-                            nullptr, nullptr) != 0) {
+                            nullptr) != 0) {
           LOG(ERROR) << "Failed to apply image patch.";
           failure_type = kPatchApplicationFailure;
           return -1;
@@ -1329,8 +1426,7 @@ static int PerformCommandDiff(CommandParameters& params) {
       } else {
         if (ApplyBSDiffPatch(params.buffer.data(), blocks * BLOCKSIZE, patch_value, 0,
                              std::bind(&RangeSinkWriter::Write, &writer, std::placeholders::_1,
-                                       std::placeholders::_2),
-                             nullptr) != 0) {
+                                       std::placeholders::_2)) != 0) {
           LOG(ERROR) << "Failed to apply bsdiff patch.";
           failure_type = kPatchApplicationFailure;
           return -1;
@@ -1492,6 +1588,35 @@ static Value* PerformBlockImageUpdate(const char* name, State* state,
     return StringValue("");
   }
 
+  // Stash directory should be different for each partition to avoid conflicts when updating
+  // multiple partitions at the same time, so we use the hash of the block device name as the base
+  // directory.
+  uint8_t digest[SHA_DIGEST_LENGTH];
+  SHA1(reinterpret_cast<const uint8_t*>(blockdev_filename->data.data()),
+       blockdev_filename->data.size(), digest);
+  params.stashbase = print_sha1(digest);
+
+  // Possibly do return early on retry, by checking the marker. If the update on this partition has
+  // been finished (but interrupted at a later point), there could be leftover on /cache that would
+  // fail the no-op retry.
+  std::string updated_marker = GetStashFileName(params.stashbase + ".UPDATED", "", "");
+  if (is_retry) {
+    struct stat sb;
+    int result = stat(updated_marker.c_str(), &sb);
+    if (result == 0) {
+      LOG(INFO) << "Skipping already updated partition " << blockdev_filename->data
+                << " based on marker";
+      return StringValue("t");
+    }
+  } else {
+    // Delete the obsolete marker if any.
+    std::string err;
+    if (!android::base::RemoveFileIfExists(updated_marker, &err)) {
+      LOG(ERROR) << "Failed to remove partition updated marker " << updated_marker << ": " << err;
+      return StringValue("");
+    }
+  }
+
   if (params.canwrite) {
     params.nti.za = za;
     params.nti.entry = new_entry;
@@ -1517,7 +1642,7 @@ static Value* PerformBlockImageUpdate(const char* name, State* state,
 
   std::vector<std::string> lines = android::base::Split(transfer_list_value->data, "\n");
   if (lines.size() < 2) {
-    ErrorAbort(state, kArgsParsingFailure, "too few lines in the transfer list [%zd]\n",
+    ErrorAbort(state, kArgsParsingFailure, "too few lines in the transfer list [%zd]",
                lines.size());
     return StringValue("");
   }
@@ -1533,7 +1658,7 @@ static Value* PerformBlockImageUpdate(const char* name, State* state,
   // Second line in transfer list is the total number of blocks we expect to write.
   size_t total_blocks;
   if (!android::base::ParseUint(lines[1], &total_blocks)) {
-    ErrorAbort(state, kArgsParsingFailure, "unexpected block count [%s]\n", lines[1].c_str());
+    ErrorAbort(state, kArgsParsingFailure, "unexpected block count [%s]", lines[1].c_str());
     return StringValue("");
   }
 
@@ -1543,7 +1668,7 @@ static Value* PerformBlockImageUpdate(const char* name, State* state,
 
   size_t start = 2;
   if (lines.size() < 4) {
-    ErrorAbort(state, kArgsParsingFailure, "too few lines in the transfer list [%zu]\n",
+    ErrorAbort(state, kArgsParsingFailure, "too few lines in the transfer list [%zu]",
                lines.size());
     return StringValue("");
   }
@@ -1554,17 +1679,34 @@ static Value* PerformBlockImageUpdate(const char* name, State* state,
   // Fourth line is the maximum number of blocks that will be stashed simultaneously
   size_t stash_max_blocks;
   if (!android::base::ParseUint(lines[3], &stash_max_blocks)) {
-    ErrorAbort(state, kArgsParsingFailure, "unexpected maximum stash blocks [%s]\n",
+    ErrorAbort(state, kArgsParsingFailure, "unexpected maximum stash blocks [%s]",
                lines[3].c_str());
     return StringValue("");
   }
 
-  int res = CreateStash(state, stash_max_blocks, blockdev_filename->data, params.stashbase);
+  int res = CreateStash(state, stash_max_blocks, params.stashbase);
   if (res == -1) {
     return StringValue("");
   }
 
   params.createdstash = res;
+
+  // When performing an update, save the index and cmdline of the current command into
+  // the last_command_file.
+  // Upon resuming an update, read the saved index first; then
+  //   1. In verification mode, check if the 'move' or 'diff' commands before the saved index has
+  //      the expected target blocks already. If not, these commands cannot be skipped and we need
+  //      to attempt to execute them again. Therefore, we will delete the last_command_file so that
+  //      the update will resume from the start of the transfer list.
+  //   2. In update mode, skip all commands before the saved index. Therefore, we can avoid deleting
+  //      stashes with duplicate id unintentionally (b/69858743); and also speed up the update.
+  // If an update succeeds or is unresumable, delete the last_command_file.
+  int saved_last_command_index;
+  if (!ParseLastCommandFile(&saved_last_command_index)) {
+    DeleteLastCommandFile();
+    // We failed to parse the last command, set it explicitly to -1.
+    saved_last_command_index = -1;
+  }
 
   start += 2;
 
@@ -1573,7 +1715,7 @@ static Value* PerformBlockImageUpdate(const char* name, State* state,
   for (size_t i = 0; i < cmdcount; ++i) {
     if (cmd_map.find(commands[i].name) != cmd_map.end()) {
       LOG(ERROR) << "Error: command [" << commands[i].name << "] already exists in the cmd map.";
-      return StringValue(strdup(""));
+      return StringValue("");
     }
     cmd_map[commands[i].name] = &commands[i];
   }
@@ -1581,14 +1723,20 @@ static Value* PerformBlockImageUpdate(const char* name, State* state,
   int rc = -1;
 
   // Subsequent lines are all individual transfer commands
-  for (auto it = lines.cbegin() + start; it != lines.cend(); it++) {
-    const std::string& line(*it);
+  for (size_t i = start; i < lines.size(); i++) {
+    const std::string& line = lines[i];
     if (line.empty()) continue;
 
     params.tokens = android::base::Split(line, " ");
     params.cpos = 0;
+    if (i - start > std::numeric_limits<int>::max()) {
+      params.cmdindex = -1;
+    } else {
+      params.cmdindex = i - start;
+    }
     params.cmdname = params.tokens[params.cpos++].c_str();
     params.cmdline = line.c_str();
+    params.target_verified = false;
 
     if (cmd_map.find(params.cmdname) == cmd_map.end()) {
       LOG(ERROR) << "unexpected command [" << params.cmdname << "]";
@@ -1597,17 +1745,54 @@ static Value* PerformBlockImageUpdate(const char* name, State* state,
 
     const Command* cmd = cmd_map[params.cmdname];
 
-    if (cmd->f != nullptr && cmd->f(params) == -1) {
+    // Skip the command if we explicitly set the corresponding function pointer to nullptr, e.g.
+    // "erase" during block_image_verify.
+    if (cmd->f == nullptr) {
+      LOG(DEBUG) << "skip executing command [" << line << "]";
+      continue;
+    }
+
+    std::string cmdname = std::string(params.cmdname);
+
+    // Skip all commands before the saved last command index when resuming an update, except for
+    // "new" command. Because new commands read in the data sequentially.
+    if (params.canwrite && params.cmdindex != -1 && params.cmdindex <= saved_last_command_index &&
+        cmdname != "new") {
+      LOG(INFO) << "Skipping already executed command: " << params.cmdindex
+                << ", last executed command for previous update: " << saved_last_command_index;
+      continue;
+    }
+
+    if (cmd->f(params) == -1) {
       LOG(ERROR) << "failed to execute command [" << line << "]";
       goto pbiudone;
     }
 
+    // In verify mode, check if the commands before the saved last_command_index have been
+    // executed correctly. If some target blocks have unexpected contents, delete the last command
+    // file so that we will resume the update from the first command in the transfer list.
+    if (!params.canwrite && saved_last_command_index != -1 && params.cmdindex != -1 &&
+        params.cmdindex <= saved_last_command_index) {
+      // TODO(xunchang) check that the cmdline of the saved index is correct.
+      if ((cmdname == "move" || cmdname == "bsdiff" || cmdname == "imgdiff") &&
+          !params.target_verified) {
+        LOG(WARNING) << "Previously executed command " << saved_last_command_index << ": "
+                     << params.cmdline << " doesn't produce expected target blocks.";
+        saved_last_command_index = -1;
+        DeleteLastCommandFile();
+      }
+    }
     if (params.canwrite) {
       if (ota_fsync(params.fd) == -1) {
         failure_type = kFsyncFailure;
         PLOG(ERROR) << "fsync failed";
         goto pbiudone;
       }
+
+      if (!UpdateLastCommandIndex(params.cmdindex, params.cmdline)) {
+        LOG(WARNING) << "Failed to update the last command file.";
+      }
+
       fprintf(cmd_pipe, "set_progress %.4f\n", static_cast<double>(params.written) / total_blocks);
       fflush(cmd_pipe);
     }
@@ -1643,6 +1828,14 @@ pbiudone:
       // Delete stash only after successfully completing the update, as it may contain blocks needed
       // to complete the update later.
       DeleteStash(params.stashbase);
+      DeleteLastCommandFile();
+
+      // Create a marker on /cache partition, which allows skipping the update on this partition on
+      // retry. The marker will be removed once booting into normal boot, or before starting next
+      // fresh install.
+      if (!SetPartitionUpdatedMarker(updated_marker)) {
+        LOG(WARNING) << "Failed to set updated marker; continuing";
+      }
     }
 
     pthread_mutex_destroy(&params.nti.mu);
@@ -1659,6 +1852,11 @@ pbiudone:
 
   if (params.nti.brotli_decoder_state != nullptr) {
     BrotliDecoderDestroyInstance(params.nti.brotli_decoder_state);
+  }
+
+  // Delete the last command file if the update cannot be resumed.
+  if (params.isunresumable) {
+    DeleteLastCommandFile();
   }
 
   // Only delete the stash if the update cannot be resumed, or it's a verification run and we
