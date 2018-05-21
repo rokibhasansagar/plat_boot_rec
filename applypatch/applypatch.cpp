@@ -40,9 +40,8 @@
 
 #include "edify/expr.h"
 #include "otafault/ota_io.h"
+#include "otautil/paths.h"
 #include "otautil/print_sha1.h"
-
-std::string cache_temp_source = "/cache/saved.file";
 
 static int LoadPartitionContents(const std::string& filename, FileContents* file);
 static size_t FileSink(const unsigned char* data, size_t len, int fd);
@@ -404,7 +403,7 @@ int applypatch_check(const char* filename, const std::vector<std::string>& patch
     // If the source file is missing or corrupted, it might be because we were killed in the middle
     // of patching it.  A copy of it should have been made in cache_temp_source.  If that file
     // exists and matches the sha1 we're looking for, the check still passes.
-    if (LoadFileContents(cache_temp_source.c_str(), &file) != 0) {
+    if (LoadFileContents(Paths::Get().cache_temp_source().c_str(), &file) != 0) {
       printf("failed to load cache file\n");
       return 1;
     }
@@ -437,22 +436,21 @@ static size_t FileSink(const unsigned char* data, size_t len, int fd) {
 
 // Return the amount of free space (in bytes) on the filesystem
 // containing filename.  filename must exist.  Return -1 on error.
-size_t FreeSpaceForFile(const char* filename) {
-    struct statfs sf;
-    if (statfs(filename, &sf) != 0) {
-        printf("failed to statfs %s: %s\n", filename, strerror(errno));
-        return -1;
-    }
-    return sf.f_bsize * sf.f_bavail;
+size_t FreeSpaceForFile(const std::string& filename) {
+  struct statfs sf;
+  if (statfs(filename.c_str(), &sf) != 0) {
+    printf("failed to statfs %s: %s\n", filename.c_str(), strerror(errno));
+    return -1;
+  }
+  return sf.f_bsize * sf.f_bavail;
 }
 
 int CacheSizeCheck(size_t bytes) {
     if (MakeFreeSpaceOnCache(bytes) < 0) {
         printf("unable to make %zu bytes available on /cache\n", bytes);
         return 1;
-    } else {
-        return 0;
     }
+    return 0;
 }
 
 // This function applies binary patches to EMMC target files in a way that is safe (the original
@@ -477,7 +475,7 @@ int CacheSizeCheck(size_t bytes) {
 // become obsolete since we have dropped the support for patching non-EMMC targets (EMMC targets
 // have the size embedded in the filename).
 int applypatch(const char* source_filename, const char* target_filename,
-               const char* target_sha1_str, size_t target_size __unused,
+               const char* target_sha1_str, size_t /* target_size */,
                const std::vector<std::string>& patch_sha1_str,
                const std::vector<std::unique_ptr<Value>>& patch_data, const Value* bonus_data) {
   printf("patch %s: ", source_filename);
@@ -527,7 +525,7 @@ int applypatch(const char* source_filename, const char* target_filename,
   printf("source file is bad; trying copy\n");
 
   FileContents copy_file;
-  if (LoadFileContents(cache_temp_source.c_str(), &copy_file) < 0) {
+  if (LoadFileContents(Paths::Get().cache_temp_source().c_str(), &copy_file) < 0) {
     printf("failed to read copy file\n");
     return 1;
   }
@@ -622,28 +620,32 @@ static int GenerateTarget(const FileContents& source_file, const std::unique_ptr
     printf("not enough free space on /cache\n");
     return 1;
   }
-  if (SaveFileContents(cache_temp_source.c_str(), &source_file) < 0) {
+  if (SaveFileContents(Paths::Get().cache_temp_source().c_str(), &source_file) < 0) {
     printf("failed to back up source file\n");
     return 1;
   }
 
   // We store the decoded output in memory.
   std::string memory_sink_str;  // Don't need to reserve space.
-  SinkFn sink = [&memory_sink_str](const unsigned char* data, size_t len) {
+  SHA_CTX ctx;
+  SHA1_Init(&ctx);
+  SinkFn sink = [&memory_sink_str, &ctx](const unsigned char* data, size_t len) {
+    if (len != 0) {
+      uint8_t digest[SHA_DIGEST_LENGTH];
+      SHA1(data, len, digest);
+      LOG(DEBUG) << "Appending " << len << " bytes data, sha1: " << short_sha1(digest);
+    }
+    SHA1_Update(&ctx, data, len);
     memory_sink_str.append(reinterpret_cast<const char*>(data), len);
     return len;
   };
 
-  SHA_CTX ctx;
-  SHA1_Init(&ctx);
-
   int result;
   if (use_bsdiff) {
-    result =
-        ApplyBSDiffPatch(source_file.data.data(), source_file.data.size(), *patch, 0, sink, &ctx);
+    result = ApplyBSDiffPatch(source_file.data.data(), source_file.data.size(), *patch, 0, sink);
   } else {
-    result = ApplyImagePatch(source_file.data.data(), source_file.data.size(), *patch, sink, &ctx,
-                             bonus_data);
+    result =
+        ApplyImagePatch(source_file.data.data(), source_file.data.size(), *patch, sink, bonus_data);
   }
 
   if (result != 0) {
@@ -654,7 +656,30 @@ static int GenerateTarget(const FileContents& source_file, const std::unique_ptr
   uint8_t current_target_sha1[SHA_DIGEST_LENGTH];
   SHA1_Final(current_target_sha1, &ctx);
   if (memcmp(current_target_sha1, target_sha1, SHA_DIGEST_LENGTH) != 0) {
-    printf("patch did not produce expected sha1\n");
+    printf("patch did not produce expected sha1 of %s\n", short_sha1(target_sha1).c_str());
+
+    printf("target size %zu sha1 %s\n", memory_sink_str.size(),
+           short_sha1(current_target_sha1).c_str());
+    printf("source size %zu sha1 %s\n", source_file.data.size(),
+           short_sha1(source_file.sha1).c_str());
+
+    uint8_t patch_digest[SHA_DIGEST_LENGTH];
+    SHA1(reinterpret_cast<const uint8_t*>(patch->data.data()), patch->data.size(), patch_digest);
+    printf("patch size %zu sha1 %s\n", patch->data.size(), short_sha1(patch_digest).c_str());
+
+    uint8_t bonus_digest[SHA_DIGEST_LENGTH];
+    SHA1(reinterpret_cast<const uint8_t*>(bonus_data->data.data()), bonus_data->data.size(),
+         bonus_digest);
+    printf("bonus size %zu sha1 %s\n", bonus_data->data.size(), short_sha1(bonus_digest).c_str());
+
+    // TODO(b/67849209) Remove after debugging the unit test flakiness.
+    if (android::base::GetMinimumLogSeverity() <= android::base::LogSeverity::DEBUG) {
+      if (WriteToPartition(reinterpret_cast<const unsigned char*>(memory_sink_str.c_str()),
+                           memory_sink_str.size(), target_filename) != 0) {
+        LOG(DEBUG) << "Failed to write patched data " << target_filename;
+      }
+    }
+
     return 1;
   } else {
     printf("now %s\n", short_sha1(target_sha1).c_str());
@@ -668,7 +693,7 @@ static int GenerateTarget(const FileContents& source_file, const std::unique_ptr
   }
 
   // Delete the backup copy of the source.
-  unlink(cache_temp_source.c_str());
+  unlink(Paths::Get().cache_temp_source().c_str());
 
   // Success!
   return 0;
