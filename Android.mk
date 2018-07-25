@@ -97,61 +97,7 @@ endif
 
 include $(BUILD_STATIC_LIBRARY)
 
-# librecovery (static library)
-# ===============================
-include $(CLEAR_VARS)
-
-LOCAL_SRC_FILES := \
-    install.cpp
-
-LOCAL_CFLAGS := $(recovery_common_cflags)
-
-ifeq ($(AB_OTA_UPDATER),true)
-    LOCAL_CFLAGS += -DAB_OTA_UPDATER=1
-endif
-
-LOCAL_MODULE := librecovery
-
-LOCAL_STATIC_LIBRARIES := \
-    libminui \
-    libotautil \
-    libvintf_recovery \
-    libcrypto_utils \
-    libcrypto \
-    libbase \
-    libziparchive \
-
-include $(BUILD_STATIC_LIBRARY)
-
-# recovery (static executable)
-# ===============================
-include $(CLEAR_VARS)
-
-LOCAL_SRC_FILES := \
-    adb_install.cpp \
-    fuse_sdcard_provider.cpp \
-    logging.cpp \
-    recovery.cpp \
-    recovery_main.cpp \
-    roots.cpp \
-
-LOCAL_MODULE := recovery
-
-LOCAL_FORCE_STATIC_EXECUTABLE := true
-
-LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/sbin
-
-# Cannot link with LLD: undefined symbol: UsbNoPermissionsLongHelpText
-# http://b/77543887, lld does not handle -Wl,--gc-sections as well as ld.
-LOCAL_USE_CLANG_LLD := false
-
-LOCAL_CFLAGS := $(recovery_common_cflags)
-
-LOCAL_C_INCLUDES += \
-    system/vold \
-
-LOCAL_STATIC_LIBRARIES := \
-    librecovery \
+librecovery_static_libraries := \
     $(TARGET_RECOVERY_UI_LIB) \
     libbootloader_message \
     libfusesideload \
@@ -174,17 +120,65 @@ LOCAL_STATIC_LIBRARIES := \
     libtinyxml2 \
     libziparchive \
     libbase \
-    libcutils \
     libutils \
+    libcutils \
     liblog \
     libselinux \
     libz \
 
+# librecovery (static library)
+# ===============================
+include $(CLEAR_VARS)
+
+LOCAL_SRC_FILES := \
+    adb_install.cpp \
+    fsck_unshare_blocks.cpp \
+    fuse_sdcard_provider.cpp \
+    install.cpp \
+    recovery.cpp \
+    roots.cpp \
+
+LOCAL_C_INCLUDES := \
+    system/vold \
+
+LOCAL_CFLAGS := $(recovery_common_cflags)
+
+LOCAL_MODULE := librecovery
+
+LOCAL_STATIC_LIBRARIES := \
+    $(librecovery_static_libraries)
+
+include $(BUILD_STATIC_LIBRARY)
+
+# recovery (static executable)
+# ===============================
+include $(CLEAR_VARS)
+
+LOCAL_SRC_FILES := \
+    logging.cpp \
+    recovery_main.cpp \
+
+LOCAL_MODULE := recovery
+
+LOCAL_FORCE_STATIC_EXECUTABLE := true
+
+LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/sbin
+
+# Cannot link with LLD: undefined symbol: UsbNoPermissionsLongHelpText
+# http://b/77543887, lld does not handle -Wl,--gc-sections as well as ld.
+LOCAL_USE_CLANG_LLD := false
+
+LOCAL_CFLAGS := $(recovery_common_cflags)
+
+LOCAL_STATIC_LIBRARIES := \
+    librecovery \
+    $(librecovery_static_libraries)
+
 LOCAL_HAL_STATIC_LIBRARIES := libhealthd
 
 LOCAL_REQUIRED_MODULES := \
-    e2fsdroid_static \
-    mke2fs_static \
+    e2fsdroid.recovery \
+    mke2fs.recovery \
     mke2fs.conf
 
 ifeq ($(TARGET_USERIMAGES_USE_F2FS),true)
@@ -192,6 +186,13 @@ ifeq ($(HOST_OS),linux)
 LOCAL_REQUIRED_MODULES += \
     sload.f2fs \
     mkfs.f2fs
+endif
+endif
+
+# e2fsck is needed for adb remount -R.
+ifeq ($(BOARD_EXT4_SHARE_DUP_BLOCKS),true)
+ifneq (,$(filter userdebug eng,$(TARGET_BUILD_VARIANT)))
+LOCAL_REQUIRED_MODULES += e2fsck_static
 endif
 endif
 
@@ -207,6 +208,5 @@ include \
     $(LOCAL_PATH)/boot_control/Android.mk \
     $(LOCAL_PATH)/minui/Android.mk \
     $(LOCAL_PATH)/tests/Android.mk \
-    $(LOCAL_PATH)/tools/Android.mk \
     $(LOCAL_PATH)/updater/Android.mk \
     $(LOCAL_PATH)/updater_sample/Android.mk \

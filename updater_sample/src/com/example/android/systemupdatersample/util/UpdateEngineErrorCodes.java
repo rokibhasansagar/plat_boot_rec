@@ -34,7 +34,9 @@ public final class UpdateEngineErrorCodes {
     * Error code from the update engine. Values must agree with the ones in
     * system/update_engine/common/error_code.h.
     */
+    public static final int UNKNOWN = -1;
     public static final int UPDATED_BUT_NOT_ACTIVE = 52;
+    public static final int USER_CANCELLED = 48;
 
     private static final SparseArray<String> CODE_TO_NAME_MAP = new SparseArray<>();
 
@@ -52,6 +54,7 @@ public final class UpdateEngineErrorCodes {
         CODE_TO_NAME_MAP.put(12, "DOWNLOAD_PAYLOAD_VERIFICATION_ERROR");
         CODE_TO_NAME_MAP.put(15, "NEW_ROOTFS_VERIFICATION_ERROR");
         CODE_TO_NAME_MAP.put(20, "DOWNLOAD_STATE_INITIALIZATION_ERROR");
+        CODE_TO_NAME_MAP.put(26, "DOWNLOAD_METADATA_SIGNATURE_MISMATCH");
         CODE_TO_NAME_MAP.put(48, "USER_CANCELLED");
         CODE_TO_NAME_MAP.put(52, "UPDATED_BUT_NOT_ACTIVE");
     }
@@ -60,7 +63,7 @@ public final class UpdateEngineErrorCodes {
      * Completion codes returned by update engine indicating that the update
      * was successfully applied.
      */
-    private static final Set<Integer> SUCCEEDED_COMPLETION_CODES = new HashSet<Integer>(
+    private static final Set<Integer> SUCCEEDED_COMPLETION_CODES = new HashSet<>(
             Arrays.asList(UpdateEngine.ErrorCodeConstants.SUCCESS,
                     // UPDATED_BUT_NOT_ACTIVE is returned when the payload is
                     // successfully applied but the

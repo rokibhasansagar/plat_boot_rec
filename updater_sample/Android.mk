@@ -19,10 +19,9 @@ include $(CLEAR_VARS)
 
 LOCAL_PACKAGE_NAME := SystemUpdaterSample
 LOCAL_SDK_VERSION := system_current
-LOCAL_MODULE_TAGS := samples
+LOCAL_PRIVILEGED_MODULE := true
 
-# TODO: enable proguard and use proguard.flags file
-LOCAL_PROGUARD_ENABLED := disabled
+LOCAL_PROGUARD_FLAG_FILES := proguard.flags
 
 LOCAL_SRC_FILES := $(call all-java-files-under, src)
 

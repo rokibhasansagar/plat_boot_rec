@@ -22,7 +22,6 @@ import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.UpdateEngine;
-import android.os.UpdateEngineCallback;
 import android.util.Log;
 import android.view.View;
 import android.widget.ArrayAdapter;
@@ -30,23 +29,17 @@ import android.widget.Button;
 import android.widget.ProgressBar;
 import android.widget.Spinner;
 import android.widget.TextView;
-import android.widget.Toast;
 
-import com.example.android.systemupdatersample.PayloadSpec;
 import com.example.android.systemupdatersample.R;
 import com.example.android.systemupdatersample.UpdateConfig;
-import com.example.android.systemupdatersample.services.PrepareStreamingService;
+import com.example.android.systemupdatersample.UpdateManager;
+import com.example.android.systemupdatersample.UpdaterState;
 import com.example.android.systemupdatersample.util.PayloadSpecs;
 import com.example.android.systemupdatersample.util.UpdateConfigs;
 import com.example.android.systemupdatersample.util.UpdateEngineErrorCodes;
-import com.example.android.systemupdatersample.util.UpdateEngineProperties;
 import com.example.android.systemupdatersample.util.UpdateEngineStatuses;
 
-import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * UI for SystemUpdaterSample app.
@@ -55,10 +48,6 @@ public class MainActivity extends Activity {
 
     private static final String TAG = "MainActivity";
 
-    /** HTTP Header: User-Agent; it will be sent to the server when streaming the payload. */
-    private static final String HTTP_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36";
-
     private TextView mTextViewBuild;
     private Spinner mSpinnerConfigs;
     private TextView mTextViewConfigsDirHint;
@@ -66,25 +55,19 @@ public class MainActivity extends Activity {
     private Button mButtonApplyConfig;
     private Button mButtonStop;
     private Button mButtonReset;
+    private Button mButtonSuspend;
+    private Button mButtonResume;
     private ProgressBar mProgressBar;
-    private TextView mTextViewStatus;
-    private TextView mTextViewCompletion;
+    private TextView mTextViewUpdaterState;
+    private TextView mTextViewEngineStatus;
+    private TextView mTextViewEngineErrorCode;
     private TextView mTextViewUpdateInfo;
     private Button mButtonSwitchSlot;
 
     private List<UpdateConfig> mConfigs;
-    private AtomicInteger mUpdateEngineStatus =
-            new AtomicInteger(UpdateEngine.UpdateStatusConstants.IDLE);
-    private PayloadSpec mLastPayloadSpec;
-    private AtomicBoolean mManualSwitchSlotRequired = new AtomicBoolean(true);
-    private final PayloadSpecs mPayloadSpecs = new PayloadSpecs();
 
-    /**
-     * Listen to {@code update_engine} events.
-     */
-    private UpdateEngineCallbackImpl mUpdateEngineCallback = new UpdateEngineCallbackImpl();
-
-    private final UpdateEngine mUpdateEngine = new UpdateEngine();
+    private final UpdateManager mUpdateManager =
+            new UpdateManager(new UpdateEngine(), new PayloadSpecs());
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -98,24 +81,46 @@ public class MainActivity extends Activity {
         this.mButtonApplyConfig = findViewById(R.id.buttonApplyConfig);
         this.mButtonStop = findViewById(R.id.buttonStop);
         this.mButtonReset = findViewById(R.id.buttonReset);
+        this.mButtonSuspend = findViewById(R.id.buttonSuspend);
+        this.mButtonResume = findViewById(R.id.buttonResume);
         this.mProgressBar = findViewById(R.id.progressBar);
-        this.mTextViewStatus = findViewById(R.id.textViewStatus);
-        this.mTextViewCompletion = findViewById(R.id.textViewCompletion);
+        this.mTextViewUpdaterState = findViewById(R.id.textViewUpdaterState);
+        this.mTextViewEngineStatus = findViewById(R.id.textViewEngineStatus);
+        this.mTextViewEngineErrorCode = findViewById(R.id.textViewEngineErrorCode);
         this.mTextViewUpdateInfo = findViewById(R.id.textViewUpdateInfo);
         this.mButtonSwitchSlot = findViewById(R.id.buttonSwitchSlot);
 
         this.mTextViewConfigsDirHint.setText(UpdateConfigs.getConfigsRoot(this));
 
-        uiReset();
+        uiResetWidgets();
         loadUpdateConfigs();
 
-        this.mUpdateEngine.bind(mUpdateEngineCallback);
+        this.mUpdateManager.setOnStateChangeCallback(this::onUpdaterStateChange);
+        this.mUpdateManager.setOnEngineStatusUpdateCallback(this::onEngineStatusUpdate);
+        this.mUpdateManager.setOnEngineCompleteCallback(this::onEnginePayloadApplicationComplete);
+        this.mUpdateManager.setOnProgressUpdateCallback(this::onProgressUpdate);
     }
 
     @Override
     protected void onDestroy() {
-        this.mUpdateEngine.unbind();
+        this.mUpdateManager.setOnEngineStatusUpdateCallback(null);
+        this.mUpdateManager.setOnProgressUpdateCallback(null);
+        this.mUpdateManager.setOnEngineCompleteCallback(null);
         super.onDestroy();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Binding to UpdateEngine invokes onStatusUpdate callback,
+        // persisted updater state has to be loaded and prepared beforehand.
+        this.mUpdateManager.bind();
+    }
+
+    @Override
+    protected void onPause() {
+        this.mUpdateManager.unbind();
+        super.onPause();
     }
 
     /**
@@ -146,11 +151,20 @@ public class MainActivity extends Activity {
                 .setMessage("Do you really want to apply this update?")
                 .setIcon(android.R.drawable.ic_dialog_alert)
                 .setPositiveButton(android.R.string.ok, (dialog, whichButton) -> {
-                    uiSetUpdating();
+                    uiResetWidgets();
+                    uiResetEngineText();
                     applyUpdate(getSelectedConfig());
                 })
                 .setNegativeButton(android.R.string.cancel, null)
                 .show();
+    }
+
+    private void applyUpdate(UpdateConfig config) {
+        try {
+            mUpdateManager.applyUpdate(this, config);
+        } catch (UpdaterState.InvalidTransitionException e) {
+            Log.e(TAG, "Failed to apply update " + config.getName(), e);
+        }
     }
 
     /**
@@ -162,9 +176,17 @@ public class MainActivity extends Activity {
                 .setMessage("Do you really want to cancel running update?")
                 .setIcon(android.R.drawable.ic_dialog_alert)
                 .setPositiveButton(android.R.string.ok, (dialog, whichButton) -> {
-                    stopRunningUpdate();
+                    cancelRunningUpdate();
                 })
                 .setNegativeButton(android.R.string.cancel, null).show();
+    }
+
+    private void cancelRunningUpdate() {
+        try {
+            mUpdateManager.cancelRunningUpdate();
+        } catch (UpdaterState.InvalidTransitionException e) {
+            Log.e(TAG, "Failed to cancel running update", e);
+        }
     }
 
     /**
@@ -182,38 +204,85 @@ public class MainActivity extends Activity {
                 .setNegativeButton(android.R.string.cancel, null).show();
     }
 
+    private void resetUpdate() {
+        try {
+            mUpdateManager.resetUpdate();
+        } catch (UpdaterState.InvalidTransitionException e) {
+            Log.e(TAG, "Failed to reset update", e);
+        }
+    }
+
+    /**
+     * suspend button clicked
+     */
+    public void onSuspendClick(View view) {
+        try {
+            mUpdateManager.suspend();
+        } catch (UpdaterState.InvalidTransitionException e) {
+            Log.e(TAG, "Failed to suspend running update", e);
+        }
+    }
+
+    /**
+     * resume button clicked
+     */
+    public void onResumeClick(View view) {
+        try {
+            uiResetWidgets();
+            uiResetEngineText();
+            mUpdateManager.resume();
+        } catch (UpdaterState.InvalidTransitionException e) {
+            Log.e(TAG, "Failed to resume running update", e);
+        }
+    }
+
     /**
      * switch slot button clicked
      */
     public void onSwitchSlotClick(View view) {
-        setSwitchSlotOnReboot();
+        uiResetWidgets();
+        mUpdateManager.setSwitchSlotOnReboot();
     }
 
     /**
-     * Invoked when anything changes. The value of {@code status} will
-     * be one of the values from {@link UpdateEngine.UpdateStatusConstants},
-     * and {@code percent} will be from {@code 0.0} to {@code 1.0}.
+     * Invoked when SystemUpdaterSample app state changes.
+     * Value of {@code state} will be one of the
+     * values from {@link UpdaterState}.
      */
-    private void onStatusUpdate(int status, float percent) {
-        mProgressBar.setProgress((int) (100 * percent));
-        if (mUpdateEngineStatus.get() != status) {
-            mUpdateEngineStatus.set(status);
-            runOnUiThread(() -> {
-                Log.e("UpdateEngine", "StatusUpdate - status="
-                        + UpdateEngineStatuses.getStatusText(status)
-                        + "/" + status);
-                Toast.makeText(this, "Update Status changed", Toast.LENGTH_LONG)
-                        .show();
-                if (status == UpdateEngine.UpdateStatusConstants.IDLE) {
-                    Log.d(TAG, "status changed, resetting ui");
-                    uiReset();
-                } else {
-                    Log.d(TAG, "status changed, setting ui to updating mode");
-                    uiSetUpdating();
-                }
-                setUiStatus(status);
-            });
-        }
+    private void onUpdaterStateChange(int state) {
+        Log.i(TAG, "UpdaterStateChange state="
+                + UpdaterState.getStateText(state)
+                + "/" + state);
+        runOnUiThread(() -> {
+            setUiUpdaterState(state);
+
+            if (state == UpdaterState.IDLE) {
+                uiStateIdle();
+            } else if (state == UpdaterState.RUNNING) {
+                uiStateRunning();
+            } else if (state == UpdaterState.PAUSED) {
+                uiStatePaused();
+            } else if (state == UpdaterState.ERROR) {
+                uiStateError();
+            } else if (state == UpdaterState.SLOT_SWITCH_REQUIRED) {
+                uiStateSlotSwitchRequired();
+            } else if (state == UpdaterState.REBOOT_REQUIRED) {
+                uiStateRebootRequired();
+            }
+        });
+    }
+
+    /**
+     * Invoked when {@link UpdateEngine} status changes. Value of {@code status} will
+     * be one of the values from {@link UpdateEngine.UpdateStatusConstants}.
+     */
+    private void onEngineStatusUpdate(int status) {
+        Log.i(TAG, "StatusUpdate - status="
+                + UpdateEngineStatuses.getStatusText(status)
+                + "/" + status);
+        runOnUiThread(() -> {
+            setUiEngineStatus(status);
+        });
     }
 
     /**
@@ -221,63 +290,92 @@ public class MainActivity extends Activity {
      * unsuccessfully. The value of {@code errorCode} will be one of the
      * values from {@link UpdateEngine.ErrorCodeConstants}.
      */
-    private void onPayloadApplicationComplete(int errorCode) {
-        final String state = UpdateEngineErrorCodes.isUpdateSucceeded(errorCode)
+    private void onEnginePayloadApplicationComplete(int errorCode) {
+        final String completionState = UpdateEngineErrorCodes.isUpdateSucceeded(errorCode)
                 ? "SUCCESS"
                 : "FAILURE";
+        Log.i(TAG,
+                "PayloadApplicationCompleted - errorCode="
+                        + UpdateEngineErrorCodes.getCodeName(errorCode) + "/" + errorCode
+                        + " " + completionState);
         runOnUiThread(() -> {
-            Log.i("UpdateEngine",
-                    "Completed - errorCode="
-                    + UpdateEngineErrorCodes.getCodeName(errorCode) + "/" + errorCode
-                    + " " + state);
-            Toast.makeText(this, "Update completed", Toast.LENGTH_LONG).show();
-            setUiCompletion(errorCode);
-            if (errorCode == UpdateEngineErrorCodes.UPDATED_BUT_NOT_ACTIVE) {
-                // if update was successfully applied.
-                if (mManualSwitchSlotRequired.get()) {
-                    // Show "Switch Slot" button.
-                    uiShowSwitchSlotInfo();
-                }
-            }
+            setUiEngineErrorCode(errorCode);
         });
     }
 
-    /** resets ui */
-    private void uiReset() {
-        mTextViewBuild.setText(Build.DISPLAY);
-        mSpinnerConfigs.setEnabled(true);
-        mButtonReload.setEnabled(true);
-        mButtonApplyConfig.setEnabled(true);
-        mButtonStop.setEnabled(false);
-        mButtonReset.setEnabled(false);
-        mProgressBar.setProgress(0);
-        mProgressBar.setEnabled(false);
-        mProgressBar.setVisibility(ProgressBar.INVISIBLE);
-        mTextViewStatus.setText(R.string.unknown);
-        mTextViewCompletion.setText(R.string.unknown);
-        uiHideSwitchSlotInfo();
+    /**
+     * Invoked when update progress changes.
+     */
+    private void onProgressUpdate(double progress) {
+        mProgressBar.setProgress((int) (100 * progress));
     }
 
-    /** sets ui updating mode */
-    private void uiSetUpdating() {
+    /** resets ui */
+    private void uiResetWidgets() {
         mTextViewBuild.setText(Build.DISPLAY);
         mSpinnerConfigs.setEnabled(false);
         mButtonReload.setEnabled(false);
         mButtonApplyConfig.setEnabled(false);
-        mButtonStop.setEnabled(true);
-        mProgressBar.setEnabled(true);
-        mButtonReset.setEnabled(true);
-        mProgressBar.setVisibility(ProgressBar.VISIBLE);
+        mButtonStop.setEnabled(false);
+        mButtonReset.setEnabled(false);
+        mButtonSuspend.setEnabled(false);
+        mButtonResume.setEnabled(false);
+        mProgressBar.setEnabled(false);
+        mProgressBar.setVisibility(ProgressBar.INVISIBLE);
+        mButtonSwitchSlot.setEnabled(false);
+        mTextViewUpdateInfo.setTextColor(Color.parseColor("#aaaaaa"));
     }
 
-    private void uiShowSwitchSlotInfo() {
+    private void uiResetEngineText() {
+        mTextViewEngineStatus.setText(R.string.unknown);
+        mTextViewEngineErrorCode.setText(R.string.unknown);
+        // Note: Do not reset mTextViewUpdaterState; UpdateManager notifies updater state properly.
+    }
+
+    private void uiStateIdle() {
+        uiResetWidgets();
+        mButtonReset.setEnabled(true);
+        mSpinnerConfigs.setEnabled(true);
+        mButtonReload.setEnabled(true);
+        mButtonApplyConfig.setEnabled(true);
+        mProgressBar.setProgress(0);
+    }
+
+    private void uiStateRunning() {
+        uiResetWidgets();
+        mProgressBar.setEnabled(true);
+        mProgressBar.setVisibility(ProgressBar.VISIBLE);
+        mButtonStop.setEnabled(true);
+        mButtonSuspend.setEnabled(true);
+    }
+
+    private void uiStatePaused() {
+        uiResetWidgets();
+        mButtonReset.setEnabled(true);
+        mProgressBar.setEnabled(true);
+        mProgressBar.setVisibility(ProgressBar.VISIBLE);
+        mButtonResume.setEnabled(true);
+    }
+
+    private void uiStateSlotSwitchRequired() {
+        uiResetWidgets();
+        mButtonReset.setEnabled(true);
+        mProgressBar.setEnabled(true);
+        mProgressBar.setVisibility(ProgressBar.VISIBLE);
         mButtonSwitchSlot.setEnabled(true);
         mTextViewUpdateInfo.setTextColor(Color.parseColor("#777777"));
     }
 
-    private void uiHideSwitchSlotInfo() {
-        mTextViewUpdateInfo.setTextColor(Color.parseColor("#AAAAAA"));
-        mButtonSwitchSlot.setEnabled(false);
+    private void uiStateError() {
+        uiResetWidgets();
+        mButtonReset.setEnabled(true);
+        mProgressBar.setEnabled(true);
+        mProgressBar.setVisibility(ProgressBar.VISIBLE);
+    }
+
+    private void uiStateRebootRequired() {
+        uiResetWidgets();
+        mButtonReset.setEnabled(true);
     }
 
     /**
@@ -291,20 +389,25 @@ public class MainActivity extends Activity {
     /**
      * @param status update engine status code
      */
-    private void setUiStatus(int status) {
+    private void setUiEngineStatus(int status) {
         String statusText = UpdateEngineStatuses.getStatusText(status);
-        mTextViewStatus.setText(statusText + "/" + status);
+        mTextViewEngineStatus.setText(statusText + "/" + status);
     }
 
     /**
      * @param errorCode update engine error code
      */
-    private void setUiCompletion(int errorCode) {
-        final String state = UpdateEngineErrorCodes.isUpdateSucceeded(errorCode)
-                ? "SUCCESS"
-                : "FAILURE";
+    private void setUiEngineErrorCode(int errorCode) {
         String errorText = UpdateEngineErrorCodes.getCodeName(errorCode);
-        mTextViewCompletion.setText(state + " " + errorText + "/" + errorCode);
+        mTextViewEngineErrorCode.setText(errorText + "/" + errorCode);
+    }
+
+    /**
+     * @param state updater sample state
+     */
+    private void setUiUpdaterState(int state) {
+        String stateText = UpdaterState.getStateText(state);
+        mTextViewUpdaterState.setText(stateText + "/" + state);
     }
 
     private void loadConfigsToSpinner(List<UpdateConfig> configs) {
@@ -319,145 +422,6 @@ public class MainActivity extends Activity {
 
     private UpdateConfig getSelectedConfig() {
         return mConfigs.get(mSpinnerConfigs.getSelectedItemPosition());
-    }
-
-    /**
-     * Applies the given update
-     */
-    private void applyUpdate(final UpdateConfig config) {
-        List<String> extraProperties = new ArrayList<>();
-
-        if (!config.getAbConfig().getForceSwitchSlot()) {
-            // Disable switch slot on reboot, which is enabled by default.
-            // User will enable it manually by clicking "Switch Slot" button on the screen.
-            extraProperties.add(UpdateEngineProperties.PROPERTY_DISABLE_SWITCH_SLOT_ON_REBOOT);
-            mManualSwitchSlotRequired.set(true);
-        } else {
-            mManualSwitchSlotRequired.set(false);
-        }
-
-        if (config.getInstallType() == UpdateConfig.AB_INSTALL_TYPE_NON_STREAMING) {
-            PayloadSpec payload;
-            try {
-                payload = mPayloadSpecs.forNonStreaming(config.getUpdatePackageFile());
-            } catch (IOException e) {
-                Log.e(TAG, "Error creating payload spec", e);
-                Toast.makeText(this, "Error creating payload spec", Toast.LENGTH_LONG)
-                        .show();
-                return;
-            }
-            updateEngineApplyPayload(payload, extraProperties);
-        } else {
-            Log.d(TAG, "Starting PrepareStreamingService");
-            PrepareStreamingService.startService(this, config, (code, payloadSpec) -> {
-                if (code == PrepareStreamingService.RESULT_CODE_SUCCESS) {
-                    extraProperties.add("USER_AGENT=" + HTTP_USER_AGENT);
-                    config.getStreamingMetadata()
-                            .getAuthorization()
-                            .ifPresent(s -> extraProperties.add("AUTHORIZATION=" + s));
-                    updateEngineApplyPayload(payloadSpec, extraProperties);
-                } else {
-                    Log.e(TAG, "PrepareStreamingService failed, result code is " + code);
-                    Toast.makeText(
-                            MainActivity.this,
-                            "PrepareStreamingService failed, result code is " + code,
-                            Toast.LENGTH_LONG).show();
-                }
-            });
-        }
-    }
-
-    /**
-     * Applies given payload.
-     *
-     * UpdateEngine works asynchronously. This method doesn't wait until
-     * end of the update.
-     *
-     * @param payloadSpec contains url, offset and size to {@code PAYLOAD_BINARY_FILE_NAME}
-     * @param extraProperties additional properties to pass to {@link UpdateEngine#applyPayload}
-     */
-    private void updateEngineApplyPayload(PayloadSpec payloadSpec, List<String> extraProperties) {
-        mLastPayloadSpec = payloadSpec;
-
-        ArrayList<String> properties = new ArrayList<>(payloadSpec.getProperties());
-        if (extraProperties != null) {
-            properties.addAll(extraProperties);
-        }
-        try {
-            mUpdateEngine.applyPayload(
-                    payloadSpec.getUrl(),
-                    payloadSpec.getOffset(),
-                    payloadSpec.getSize(),
-                    properties.toArray(new String[0]));
-        } catch (Exception e) {
-            Log.e(TAG, "UpdateEngine failed to apply the update", e);
-            Toast.makeText(
-                    this,
-                    "UpdateEngine failed to apply the update",
-                    Toast.LENGTH_LONG).show();
-        }
-    }
-
-    /**
-     * Sets the new slot that has the updated partitions as the active slot,
-     * which device will boot into next time.
-     * This method is only supposed to be called after the payload is applied.
-     *
-     * Invoking {@link UpdateEngine#applyPayload} with the same payload url, offset, size
-     * and payload metadata headers doesn't trigger new update. It can be used to just switch
-     * active A/B slot.
-     *
-     * {@link UpdateEngine#applyPayload} might take several seconds to finish, and it will
-     * invoke callbacks {@link this#onStatusUpdate} and {@link this#onPayloadApplicationComplete)}.
-     */
-    private void setSwitchSlotOnReboot() {
-        Log.d(TAG, "setSwitchSlotOnReboot invoked");
-        List<String> extraProperties = new ArrayList<>();
-        // PROPERTY_SKIP_POST_INSTALL should be passed on to skip post-installation hooks.
-        extraProperties.add(UpdateEngineProperties.PROPERTY_SKIP_POST_INSTALL);
-        // It sets property SWITCH_SLOT_ON_REBOOT=1 by default.
-        // HTTP headers are not required, UpdateEngine is not expected to stream payload.
-        updateEngineApplyPayload(mLastPayloadSpec, extraProperties);
-        uiHideSwitchSlotInfo();
-    }
-
-    /**
-     * Requests update engine to stop any ongoing update. If an update has been applied,
-     * leave it as is.
-     */
-    private void stopRunningUpdate() {
-        try {
-            mUpdateEngine.cancel();
-        } catch (Exception e) {
-            Log.w(TAG, "UpdateEngine failed to stop the ongoing update", e);
-        }
-    }
-
-    /**
-     * Resets update engine to IDLE state. Requests to cancel any onging update, or to revert if an
-     * update has been applied.
-     */
-    private void resetUpdate() {
-        try {
-            mUpdateEngine.resetStatus();
-        } catch (Exception e) {
-            Log.w(TAG, "UpdateEngine failed to reset the update", e);
-        }
-    }
-
-    /**
-     * Helper class to delegate {@code update_engine} callbacks to MainActivity
-     */
-    class UpdateEngineCallbackImpl extends UpdateEngineCallback {
-        @Override
-        public void onStatusUpdate(int status, float percent) {
-            MainActivity.this.onStatusUpdate(status, percent);
-        }
-
-        @Override
-        public void onPayloadApplicationComplete(int errorCode) {
-            MainActivity.this.onPayloadApplicationComplete(errorCode);
-        }
     }
 
 }

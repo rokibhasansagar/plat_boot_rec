@@ -54,16 +54,12 @@ static bool ApplyBSDiffPatchAndStreamOutput(const uint8_t* src_data, size_t src_
                                             const Value& patch, size_t patch_offset,
                                             const char* deflate_header, SinkFn sink) {
   size_t expected_target_length = static_cast<size_t>(Read8(deflate_header + 32));
+  CHECK_GT(expected_target_length, 0);
   int level = Read4(deflate_header + 40);
   int method = Read4(deflate_header + 44);
   int window_bits = Read4(deflate_header + 48);
   int mem_level = Read4(deflate_header + 52);
   int strategy = Read4(deflate_header + 56);
-
-  // TODO(b/67849209) Remove after debugging the unit test flakiness.
-  if (android::base::GetMinimumLogSeverity() <= android::base::LogSeverity::DEBUG) {
-    LOG(DEBUG) << "zlib version " << zlibVersion();
-  }
 
   z_stream strm;
   strm.zalloc = Z_NULL;
@@ -82,10 +78,8 @@ static bool ApplyBSDiffPatchAndStreamOutput(const uint8_t* src_data, size_t src_
   size_t actual_target_length = 0;
   size_t total_written = 0;
   static constexpr size_t buffer_size = 32768;
-  SHA_CTX sha_ctx;
-  SHA1_Init(&sha_ctx);
   auto compression_sink = [&strm, &actual_target_length, &expected_target_length, &total_written,
-                           &ret, &sink, &sha_ctx](const uint8_t* data, size_t len) -> size_t {
+                           &ret, &sink](const uint8_t* data, size_t len) -> size_t {
     // The input patch length for an update never exceeds INT_MAX.
     strm.avail_in = len;
     strm.next_in = data;
@@ -112,11 +106,6 @@ static bool ApplyBSDiffPatchAndStreamOutput(const uint8_t* src_data, size_t src_
       }
     } while ((strm.avail_in != 0 || strm.avail_out == 0) && ret != Z_STREAM_END);
 
-    // TODO(b/67849209) Remove after debugging the unit test flakiness.
-    if (android::base::GetMinimumLogSeverity() <= android::base::LogSeverity::DEBUG) {
-      SHA1_Update(&sha_ctx, data, len);
-    }
-
     actual_target_length += len;
     return len;
   };
@@ -124,11 +113,6 @@ static bool ApplyBSDiffPatchAndStreamOutput(const uint8_t* src_data, size_t src_
   int bspatch_result = ApplyBSDiffPatch(src_data, src_len, patch, patch_offset, compression_sink);
   deflateEnd(&strm);
 
-  if (android::base::GetMinimumLogSeverity() <= android::base::LogSeverity::DEBUG) {
-    uint8_t digest[SHA_DIGEST_LENGTH];
-    SHA1_Final(digest, &sha_ctx);
-    LOG(DEBUG) << "sha1 of " << actual_target_length << " bytes input data: " << short_sha1(digest);
-  }
   if (bspatch_result != 0) {
     return false;
   }
@@ -143,14 +127,15 @@ static bool ApplyBSDiffPatchAndStreamOutput(const uint8_t* src_data, size_t src_
                << actual_target_length;
     return false;
   }
-  LOG(DEBUG) << "bspatch writes " << total_written << " bytes in total to streaming output.";
+  LOG(DEBUG) << "bspatch wrote " << total_written << " bytes in total to streaming output.";
 
   return true;
 }
 
 int ApplyImagePatch(const unsigned char* old_data, size_t old_size, const unsigned char* patch_data,
                     size_t patch_size, SinkFn sink) {
-  Value patch(VAL_BLOB, std::string(reinterpret_cast<const char*>(patch_data), patch_size));
+  Value patch(Value::Type::BLOB,
+              std::string(reinterpret_cast<const char*>(patch_data), patch_size));
   return ApplyImagePatch(old_data, old_size, patch, sink, nullptr);
 }
 
@@ -245,11 +230,10 @@ int ApplyImagePatch(const unsigned char* old_data, size_t old_size, const Value&
       // Decompress the source data; the chunk header tells us exactly
       // how big we expect it to be when decompressed.
 
-      // Note: expanded_len will include the bonus data size if
-      // the patch was constructed with bonus data.  The
-      // deflation will come up 'bonus_size' bytes short; these
-      // must be appended from the bonus_data value.
-      size_t bonus_size = (i == 1 && bonus_data != NULL) ? bonus_data->data.size() : 0;
+      // Note: expanded_len will include the bonus data size if the patch was constructed with
+      // bonus data. The deflation will come up 'bonus_size' bytes short; these must be appended
+      // from the bonus_data value.
+      size_t bonus_size = (i == 1 && bonus_data != nullptr) ? bonus_data->data.size() : 0;
 
       std::vector<unsigned char> expanded_source(expanded_len);
 
@@ -287,7 +271,7 @@ int ApplyImagePatch(const unsigned char* old_data, size_t old_size, const Value&
         inflateEnd(&strm);
 
         if (bonus_size) {
-          memcpy(expanded_source.data() + (expanded_len - bonus_size), &bonus_data->data[0],
+          memcpy(expanded_source.data() + (expanded_len - bonus_size), bonus_data->data.data(),
                  bonus_size);
         }
       }

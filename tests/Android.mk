@@ -16,17 +16,40 @@
 
 LOCAL_PATH := $(call my-dir)
 
+# libapplypatch, libapplypatch_modes, libimgdiff, libimgpatch.
+libapplypatch_static_libraries := \
+    libapplypatch_modes \
+    libapplypatch \
+    libedify \
+    libimgdiff \
+    libimgpatch \
+    libotafault \
+    libotautil \
+    libbsdiff \
+    libbspatch \
+    libdivsufsort \
+    libdivsufsort64 \
+    libutils \
+    libbase \
+    libbrotli \
+    libbz \
+    libcrypto \
+    libz \
+    libziparchive \
+
 # Unit tests
 include $(CLEAR_VARS)
 LOCAL_CFLAGS := -Wall -Werror
 LOCAL_MODULE := recovery_unit_test
 LOCAL_COMPATIBILITY_SUITE := device-tests
 LOCAL_STATIC_LIBRARIES := \
+    $(libapplypatch_static_libraries) \
     libverifier \
     librecovery_ui \
     libminui \
     libotautil \
     libupdater \
+    libgtest_prod \
     libpng \
     libziparchive \
     libutils \
@@ -36,7 +59,9 @@ LOCAL_STATIC_LIBRARIES := \
     libBionicGtestMain
 
 LOCAL_SRC_FILES := \
+    unit/applypatch_test.cpp \
     unit/asn1_decoder_test.cpp \
+    unit/commands_test.cpp \
     unit/dirutil_test.cpp \
     unit/locale_test.cpp \
     unit/rangeset_test.cpp \
@@ -71,15 +96,11 @@ LOCAL_CFLAGS := \
     -Werror \
     -D_FILE_OFFSET_BITS=64
 
-ifeq ($(AB_OTA_UPDATER),true)
-LOCAL_CFLAGS += -DAB_OTA_UPDATER=1
-endif
-
 LOCAL_MODULE := recovery_component_test
 LOCAL_COMPATIBILITY_SUITE := device-tests
 LOCAL_C_INCLUDES := bootable/recovery
 LOCAL_SRC_FILES := \
-    component/applypatch_test.cpp \
+    component/applypatch_modes_test.cpp \
     component/bootloader_message_test.cpp \
     component/edify_test.cpp \
     component/imgdiff_test.cpp \
@@ -93,26 +114,6 @@ LOCAL_SRC_FILES := \
 
 LOCAL_SHARED_LIBRARIES := \
     libhidlbase
-
-# libapplypatch, libapplypatch_modes, libimgdiff, libimgpatch.
-libapplypatch_static_libraries := \
-    libapplypatch_modes \
-    libapplypatch \
-    libedify \
-    libimgdiff \
-    libimgpatch \
-    libotafault \
-    libotautil \
-    libbsdiff \
-    libbspatch \
-    libdivsufsort \
-    libdivsufsort64 \
-    libutils \
-    libbase \
-    libbz \
-    libcrypto \
-    libz \
-    libziparchive \
 
 tune2fs_static_libraries := \
     libext2_com_err \
@@ -136,6 +137,7 @@ libupdater_static_libraries := \
     libfec \
     libfec_rs \
     libfs_mgr \
+    libgtest_prod \
     liblog \
     libselinux \
     libsparse \
@@ -174,8 +176,8 @@ librecovery_static_libraries := \
     libtinyxml2 \
     libziparchive \
     libbase \
-    libcutils \
     libutils \
+    libcutils \
     liblog \
     libselinux \
     libz \

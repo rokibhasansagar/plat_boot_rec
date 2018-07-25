@@ -55,6 +55,7 @@
 #include "adb_install.h"
 #include "common.h"
 #include "device.h"
+#include "fsck_unshare_blocks.h"
 #include "fuse_sdcard_provider.h"
 #include "fuse_sideload.h"
 #include "install.h"
@@ -819,15 +820,13 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
         break;
       }
       case Device::MOUNT_SYSTEM:
-        // For a system image built with the root directory (i.e. system_root_image == "true"), we
-        // mount it to /system_root, and symlink /system to /system_root/system to make adb shell
-        // work (the symlink is created through the build system). (Bug: 22855115)
+        // the system partition is mounted at /mnt/system
         if (android::base::GetBoolProperty("ro.build.system_root_image", false)) {
-          if (ensure_path_mounted_at("/", "/system_root") != -1) {
+          if (ensure_path_mounted_at("/", "/mnt/system") != -1) {
             ui->Print("Mounted /system.\n");
           }
         } else {
-          if (ensure_path_mounted("/system") != -1) {
+          if (ensure_path_mounted_at("/system", "/mnt/system") != -1) {
             ui->Print("Mounted /system.\n");
           }
         }
@@ -964,11 +963,8 @@ static void log_failure_code(ErrorCode code, const std::string& update_package) 
 }
 
 Device::BuiltinAction start_recovery(Device* device, const std::vector<std::string>& args) {
-  std::vector<char*> args_to_parse(args.size());
-  std::transform(args.cbegin(), args.cend(), args_to_parse.begin(),
-                 [](const std::string& arg) { return const_cast<char*>(arg.c_str()); });
-
   static constexpr struct option OPTIONS[] = {
+    { "fsck_unshare_blocks", no_argument, nullptr, 0 },
     { "just_exit", no_argument, nullptr, 'x' },
     { "locale", required_argument, nullptr, 0 },
     { "prompt_and_wipe_data", no_argument, nullptr, 0 },
@@ -997,13 +993,19 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   bool sideload_auto_reboot = false;
   bool just_exit = false;
   bool shutdown_after = false;
+  bool fsck_unshare_blocks = false;
   int retry_count = 0;
   bool security_update = false;
   std::string locale;
 
+  auto args_to_parse = StringVectorToNullTerminatedArray(args);
+
   int arg;
   int option_index;
-  while ((arg = getopt_long(args_to_parse.size(), args_to_parse.data(), "", OPTIONS,
+  // Parse everything before the last element (which must be a nullptr). getopt_long(3) expects a
+  // null-terminated char* array, but without counting null as an arg (i.e. argv[argc] should be
+  // nullptr).
+  while ((arg = getopt_long(args_to_parse.size() - 1, args_to_parse.data(), "", OPTIONS,
                             &option_index)) != -1) {
     switch (arg) {
       case 't':
@@ -1014,7 +1016,9 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
         break;
       case 0: {
         std::string option = OPTIONS[option_index].name;
-        if (option == "locale") {
+        if (option == "fsck_unshare_blocks") {
+          fsck_unshare_blocks = true;
+        } else if (option == "locale") {
           // Handled in recovery_main.cpp
         } else if (option == "prompt_and_wipe_data") {
           should_prompt_and_wipe_data = true;
@@ -1062,6 +1066,11 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   if (!stage.empty() && sscanf(stage.c_str(), "%d/%d", &st_cur, &st_max) == 2) {
     ui->SetStage(st_cur, st_max);
   }
+
+  std::vector<std::string> title_lines =
+      android::base::Split(android::base::GetProperty("ro.bootimage.build.fingerprint", ""), ":");
+  title_lines.insert(std::begin(title_lines), "Android Recovery");
+  ui->SetTitle(title_lines);
 
   device->StartRecovery();
 
@@ -1175,6 +1184,10 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     ui->Print("\nInstall from ADB complete (status: %d).\n", status);
     if (sideload_auto_reboot) {
       ui->Print("Rebooting automatically.\n");
+    }
+  } else if (fsck_unshare_blocks) {
+    if (!do_fsck_unshare_blocks()) {
+      status = INSTALL_ERROR;
     }
   } else if (!just_exit) {
     // If this is an eng or userdebug build, automatically turn on the text display if no command
