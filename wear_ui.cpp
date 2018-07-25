@@ -16,7 +16,6 @@
 
 #include "wear_ui.h"
 
-#include <pthread.h>
 #include <string.h>
 
 #include <string>
@@ -54,6 +53,13 @@ void WearRecoveryUI::draw_background_locked() {
     int frame_x = (gr_fb_width() - frame_width) / 2;
     int frame_y = (gr_fb_height() - frame_height) / 2;
     gr_blit(frame, 0, 0, frame_width, frame_height, frame_x, frame_y);
+
+    // Draw recovery text on screen above progress bar.
+    GRSurface* text = GetCurrentText();
+    int text_x = (ScreenWidth() - gr_get_width(text)) / 2;
+    int text_y = GetProgressBaseline() - gr_get_height(text) - 10;
+    gr_color(255, 255, 255, 255);
+    gr_texticon(text_x, text_y, text);
   }
 }
 
@@ -86,11 +92,10 @@ void WearRecoveryUI::SetStage(int /* current */, int /* max */) {}
 
 void WearRecoveryUI::StartMenu(const std::vector<std::string>& headers,
                                const std::vector<std::string>& items, size_t initial_selection) {
-  pthread_mutex_lock(&updateMutex);
+  std::lock_guard<std::mutex> lg(updateMutex);
   if (text_rows_ > 0 && text_cols_ > 0) {
     menu_ = std::make_unique<Menu>(scrollable_menu_, text_rows_ - kMenuUnusableRows - 1,
                                    text_cols_ - 1, headers, items, initial_selection);
     update_screen_locked();
   }
-  pthread_mutex_unlock(&updateMutex);
 }

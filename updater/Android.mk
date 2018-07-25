@@ -35,6 +35,7 @@ updater_common_static_libraries := \
     libfec \
     libfec_rs \
     libfs_mgr \
+    libgtest_prod \
     liblog \
     libselinux \
     libsparse \
@@ -56,6 +57,7 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := libupdater
 
 LOCAL_SRC_FILES := \
+    commands.cpp \
     install.cpp \
     blockimg.cpp
 

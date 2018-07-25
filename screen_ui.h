@@ -17,12 +17,13 @@
 #ifndef RECOVERY_SCREEN_UI_H
 #define RECOVERY_SCREEN_UI_H
 
-#include <pthread.h>
 #include <stdio.h>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ui.h"
@@ -112,6 +113,7 @@ class ScreenRecoveryUI : public RecoveryUI {
 
   ScreenRecoveryUI();
   explicit ScreenRecoveryUI(bool scrollable_menu);
+  ~ScreenRecoveryUI() override;
 
   bool Init(const std::string& locale) override;
   std::string GetLocale() const override;
@@ -141,6 +143,7 @@ class ScreenRecoveryUI : public RecoveryUI {
   size_t ShowMenu(const std::vector<std::string>& headers, const std::vector<std::string>& items,
                   size_t initial_selection, bool menu_only,
                   const std::function<int(int, bool)>& key_handler) override;
+  void SetTitle(const std::vector<std::string>& lines) override;
 
   void KeyLongPress(int) override;
 
@@ -188,7 +191,6 @@ class ScreenRecoveryUI : public RecoveryUI {
   GRSurface* GetCurrentFrame() const;
   GRSurface* GetCurrentText() const;
 
-  static void* ProgressThreadStartRoutine(void* data);
   void ProgressThreadLoop();
 
   virtual void ShowFile(FILE*);
@@ -266,13 +268,16 @@ class ScreenRecoveryUI : public RecoveryUI {
   bool show_text;
   bool show_text_ever;  // has show_text ever been true?
 
+  std::vector<std::string> title_lines_;
+
   bool scrollable_menu_;
   std::unique_ptr<Menu> menu_;
 
   // An alternate text screen, swapped with 'text_' when we're viewing a log file.
   char** file_viewer_text_;
 
-  pthread_t progress_thread_;
+  std::thread progress_thread_;
+  std::atomic<bool> progress_thread_stopped_{ false };
 
   // Number of intro frames and loop frames in the animation.
   size_t intro_frames;
@@ -290,7 +295,7 @@ class ScreenRecoveryUI : public RecoveryUI {
   std::string locale_;
   bool rtl_locale_;
 
-  pthread_mutex_t updateMutex;
+  std::mutex updateMutex;
 
  private:
   void SetLocale(const std::string&);
