@@ -12,27 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-cc_library {
-    name: "libfusesideload",
-    recovery_available: true,
+android_test {
+    name: "SystemUpdaterSampleTests",
+    sdk_version: "system_current",
 
-    cflags: [
-        "-D_XOPEN_SOURCE",
-        "-D_GNU_SOURCE",
-        "-Wall",
-        "-Werror",
+    libs: [
+        "android.test.base.stubs",
+        "android.test.runner.stubs",
+        "SystemUpdaterSample",
     ],
 
-    srcs: [
-        "fuse_sideload.cpp",
+    static_libs: [
+        "android-support-test",
+        "mockito-target-minus-junit4",
+        "guava",
     ],
 
-    export_include_dirs: [
-        "include",
-    ],
+    instrumentation_for: "com.example.android.systemupdatersample",
 
-    shared_libs: [
-        "libbase",
-        "libcrypto",
-    ],
+    optimize: {
+        enabled: false,
+    },
+
+    resource_dirs: ["res"],
+
+    srcs: ["src/**/*.java"],
 }

@@ -12,27 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-cc_library {
-    name: "libfusesideload",
-    recovery_available: true,
+android_app {
+    name: "SystemUpdaterSample",
+    sdk_version: "system_current",
+    privileged: true,
 
-    cflags: [
-        "-D_XOPEN_SOURCE",
-        "-D_GNU_SOURCE",
-        "-Wall",
-        "-Werror",
+    srcs: ["src/**/*.java"],
+
+    static_libs: [
+        "guava",
     ],
 
-    srcs: [
-        "fuse_sideload.cpp",
-    ],
+    optimize: {
+        proguard_flags_files: [
+            "proguard.flags",
+        ],
+    },
 
-    export_include_dirs: [
-        "include",
-    ],
-
-    shared_libs: [
-        "libbase",
-        "libcrypto",
-    ],
+    resource_dirs: ["res"],
 }

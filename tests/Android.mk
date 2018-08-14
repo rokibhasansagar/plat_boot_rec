@@ -127,44 +127,55 @@ tune2fs_static_libraries := \
 libupdater_static_libraries := \
     libupdater \
     libapplypatch \
+    libbootloader_message \
     libbspatch \
     libedify \
-    libziparchive \
-    libotautil \
-    libbootloader_message \
-    libutils \
     libotafault \
+    libotautil \
     libext4_utils \
     libfec \
     libfec_rs \
+    libverity_tree \
     libfs_mgr \
     libgtest_prod \
     liblog \
     libselinux \
     libsparse \
     libsquashfs_utils \
+    libbrotli \
     libbz \
+    libziparchive \
     libz \
     libbase \
     libcrypto \
     libcrypto_utils \
     libcutils \
+    libutils \
     libtune2fs \
-    libbrotli \
     $(tune2fs_static_libraries)
+
+health_hal_static_libraries := \
+    android.hardware.health@2.0-impl \
+    android.hardware.health@2.0 \
+    android.hardware.health@1.0 \
+    android.hardware.health@1.0-convert \
+    libhealthstoragedefault \
+    libhidltransport \
+    libhidlbase \
+    libhwbinder_noltopgo \
+    libvndksupport \
+    libbatterymonitor
 
 librecovery_static_libraries := \
     librecovery \
-    $(TARGET_RECOVERY_UI_LIB) \
     libbootloader_message \
     libfusesideload \
-    libminadbd \
+    librecovery_ui_default \
     librecovery_ui \
     libminui \
     libverifier \
     libotautil \
-    libasyncio \
-    libbatterymonitor \
+    $(health_hal_static_libraries) \
     libcrypto_utils \
     libcrypto \
     libext4_utils \
@@ -195,7 +206,7 @@ LOCAL_STATIC_LIBRARIES := \
 
 LOCAL_TEST_DATA := \
     $(call find-test-data-in-subdirs, $(LOCAL_PATH), "*", testdata) \
-    $(call find-test-data-in-subdirs, bootable/recovery, "*_text.png", res-*)
+    $(call find-test-data-in-subdirs, $(LOCAL_PATH), "*_text.png", res-testdata)
 include $(BUILD_NATIVE_TEST)
 
 # Host tests
