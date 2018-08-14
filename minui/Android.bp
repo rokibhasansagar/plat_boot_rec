@@ -1,4 +1,4 @@
-// Copyright (C) 2016 The Android Open Source Project
+// Copyright (C) 2018 The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,43 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-cc_library_static {
-    name: "libotautil",
-
-    host_supported: true,
+cc_library {
+    name: "libminui",
     recovery_available: true,
 
     defaults: [
         "recovery_defaults",
     ],
 
-    // Minimal set of files to support host build.
-    srcs: [
-        "paths.cpp",
-        "rangeset.cpp",
-    ],
-
-    shared_libs: [
-        "libbase",
-    ],
-
     export_include_dirs: [
         "include",
     ],
 
-    target: {
-        android: {
-            srcs: [
-                "dirutil.cpp",
-                "mounts.cpp",
-                "sysutil.cpp",
-                "thermalutil.cpp",
-            ],
+    srcs: [
+        "events.cpp",
+        "graphics.cpp",
+        "graphics_adf.cpp",
+        "graphics_drm.cpp",
+        "graphics_fbdev.cpp",
+        "resources.cpp",
+    ],
 
-            shared_libs: [
-                "libcutils",
-                "libselinux",
-            ],
-        },
-    },
+    whole_static_libs: [
+        "libadf",
+        "libdrm",
+        "libsync",
+    ],
+
+    shared_libs: [
+        "libbase",
+        "libpng",
+        "libz",
+    ],
 }
