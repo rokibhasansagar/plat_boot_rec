@@ -21,6 +21,8 @@ cc_defaults {
         "-Werror",
     ],
 
+    cpp_std: "experimental",
+
     include_dirs: [
         "system/core/adb",
     ],
@@ -52,6 +54,7 @@ cc_library {
 
 cc_test {
     name: "minadbd_test",
+    isolated: true,
 
     defaults: [
         "minadbd_defaults",
@@ -64,7 +67,6 @@ cc_test {
     static_libs: [
         "libminadbd_services",
         "libadbd",
-        "libBionicGtestMain",
     ],
 
     shared_libs: [

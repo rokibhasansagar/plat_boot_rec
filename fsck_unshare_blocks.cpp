@@ -120,14 +120,10 @@ bool do_fsck_unshare_blocks() {
   std::vector<std::string> partitions = { "/odm", "/oem", "/product", "/vendor" };
 
   // Temporarily mount system so we can copy e2fsck_static.
-  bool mounted = false;
-  if (android::base::GetBoolProperty("ro.build.system_root_image", false)) {
-    mounted = ensure_path_mounted_at("/", "/mnt/system") != -1;
-    partitions.push_back("/");
-  } else {
-    mounted = ensure_path_mounted_at("/system", "/mnt/system") != -1;
-    partitions.push_back("/system");
-  }
+  std::string system_root = get_system_root();
+  bool mounted = ensure_path_mounted_at(system_root, "/mnt/system") != -1;
+  partitions.push_back(system_root);
+
   if (!mounted) {
     LOG(ERROR) << "Failed to mount system image.";
     return false;

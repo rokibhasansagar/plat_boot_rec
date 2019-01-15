@@ -162,6 +162,20 @@ class RecoveryUI {
                           const std::vector<std::string>& items, size_t initial_selection,
                           bool menu_only, const std::function<int(int, bool)>& key_handler) = 0;
 
+  // Displays the localized wipe data menu with pre-generated graphs. If there's an issue
+  // with the graphs, falls back to use the backup string headers and items instead. The initial
+  // selection is the 0th item in the menu, which is expected to reboot the device without a wipe.
+  virtual size_t ShowPromptWipeDataMenu(const std::vector<std::string>& backup_headers,
+                                        const std::vector<std::string>& backup_items,
+                                        const std::function<int(int, bool)>& key_handler) = 0;
+
+  // Displays the localized wipe data confirmation menu with pre-generated images. Falls back to
+  // the text strings upon failures. The initial selection is the 0th item, which returns to the
+  // upper level menu.
+  virtual size_t ShowPromptWipeDataConfirmationMenu(
+      const std::vector<std::string>& backup_headers, const std::vector<std::string>& backup_items,
+      const std::function<int(int, bool)>& key_handler) = 0;
+
   // Resets the key interrupt status.
   void ResetKeyInterruptStatus() {
     key_interrupted_ = false;
