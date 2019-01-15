@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -32,7 +33,6 @@
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include <android-base/test_utils.h>
 #include <bootloader_message/bootloader_message.h>
 #include <brotli/encode.h>
 #include <bsdiff/bsdiff.h>
@@ -41,6 +41,7 @@
 #include <ziparchive/zip_archive.h>
 #include <ziparchive/zip_writer.h>
 
+#include "applypatch/applypatch.h"
 #include "common/test_constants.h"
 #include "edify/expr.h"
 #include "otautil/error_code.h"
@@ -133,9 +134,9 @@ static void RunBlockImageUpdate(bool is_verify, const PackageEntries& entries,
   CloseArchive(handle);
 }
 
-static std::string get_sha1(const std::string& content) {
+static std::string GetSha1(std::string_view content) {
   uint8_t digest[SHA_DIGEST_LENGTH];
-  SHA1(reinterpret_cast<const uint8_t*>(content.c_str()), content.size(), digest);
+  SHA1(reinterpret_cast<const uint8_t*>(content.data()), content.size(), digest);
   return print_sha1(digest);
 }
 
@@ -186,7 +187,7 @@ class UpdaterTest : public ::testing::Test {
 
     // Clear partition updated marker if any.
     std::string updated_marker{ temp_stash_base_.path };
-    updated_marker += "/" + get_sha1(image_temp_file_.path) + ".UPDATED";
+    updated_marker += "/" + GetSha1(image_temp_file_.path) + ".UPDATED";
     ASSERT_TRUE(android::base::RemoveFileIfExists(updated_marker));
   }
 
@@ -214,55 +215,47 @@ TEST_F(UpdaterTest, getprop) {
     expect(nullptr, "getprop(\"arg1\", \"arg2\")", kArgsParsingFailure);
 }
 
-TEST_F(UpdaterTest, apply_patch_check) {
-  // Zero-argument is not valid.
-  expect(nullptr, "apply_patch_check()", kArgsParsingFailure);
+TEST_F(UpdaterTest, patch_partition_check) {
+  // Zero argument is not valid.
+  expect(nullptr, "patch_partition_check()", kArgsParsingFailure);
 
-  // File not found.
-  expect("", "apply_patch_check(\"/doesntexist\")", kNoCause);
+  std::string source_file = from_testdata_base("boot.img");
+  std::string source_content;
+  ASSERT_TRUE(android::base::ReadFileToString(source_file, &source_content));
+  size_t source_size = source_content.size();
+  std::string source_hash = GetSha1(source_content);
+  Partition source(source_file, source_size, source_hash);
 
-  std::string src_file = from_testdata_base("boot.img");
-  std::string src_content;
-  ASSERT_TRUE(android::base::ReadFileToString(src_file, &src_content));
-  size_t src_size = src_content.size();
-  std::string src_hash = get_sha1(src_content);
+  std::string target_file = from_testdata_base("recovery.img");
+  std::string target_content;
+  ASSERT_TRUE(android::base::ReadFileToString(target_file, &target_content));
+  size_t target_size = target_content.size();
+  std::string target_hash = GetSha1(target_content);
+  Partition target(target_file, target_size, target_hash);
 
-  // One-argument with EMMC:file:size:sha1 should pass the check.
-  std::string filename = android::base::Join(
-      std::vector<std::string>{ "EMMC", src_file, std::to_string(src_size), src_hash }, ":");
-  std::string cmd = "apply_patch_check(\"" + filename + "\")";
+  // One argument is not valid.
+  expect(nullptr, "patch_partition_check(\"" + source.ToString() + "\")", kArgsParsingFailure);
+  expect(nullptr, "patch_partition_check(\"" + target.ToString() + "\")", kArgsParsingFailure);
+
+  // Both of the source and target have the desired checksum.
+  std::string cmd =
+      "patch_partition_check(\"" + source.ToString() + "\", \"" + target.ToString() + "\")";
   expect("t", cmd, kNoCause);
 
-  // EMMC:file:(size-1):sha1:(size+1):sha1 should fail the check.
-  std::string filename_bad = android::base::Join(
-      std::vector<std::string>{ "EMMC", src_file, std::to_string(src_size - 1), src_hash,
-                                std::to_string(src_size + 1), src_hash },
-      ":");
-  cmd = "apply_patch_check(\"" + filename_bad + "\")";
+  // Only source partition has the desired checksum.
+  Partition bad_target(target_file, target_size - 1, target_hash);
+  cmd = "patch_partition_check(\"" + source.ToString() + "\", \"" + bad_target.ToString() + "\")";
+  expect("t", cmd, kNoCause);
+
+  // Only target partition has the desired checksum.
+  Partition bad_source(source_file, source_size + 1, source_hash);
+  cmd = "patch_partition_check(\"" + bad_source.ToString() + "\", \"" + target.ToString() + "\")";
+  expect("t", cmd, kNoCause);
+
+  // Neither of the source or target has the desired checksum.
+  cmd =
+      "patch_partition_check(\"" + bad_source.ToString() + "\", \"" + bad_target.ToString() + "\")";
   expect("", cmd, kNoCause);
-
-  // EMMC:file:(size-1):sha1:size:sha1:(size+1):sha1 should pass the check.
-  filename_bad =
-      android::base::Join(std::vector<std::string>{ "EMMC", src_file, std::to_string(src_size - 1),
-                                                    src_hash, std::to_string(src_size), src_hash,
-                                                    std::to_string(src_size + 1), src_hash },
-                          ":");
-  cmd = "apply_patch_check(\"" + filename_bad + "\")";
-  expect("t", cmd, kNoCause);
-
-  // Multiple arguments.
-  // As long as it successfully loads the partition specified in filename, it won't check against
-  // any given SHAs.
-  cmd = "apply_patch_check(\"" + filename + "\", \"wrong_sha1\", \"wrong_sha2\")";
-  expect("t", cmd, kNoCause);
-
-  cmd = "apply_patch_check(\"" + filename + "\", \"wrong_sha1\", \"" + src_hash +
-        "\", \"wrong_sha2\")";
-  expect("t", cmd, kNoCause);
-
-  cmd = "apply_patch_check(\"" + filename_bad + "\", \"wrong_sha1\", \"" + src_hash +
-        "\", \"wrong_sha2\")";
-  expect("t", cmd, kNoCause);
 }
 
 TEST_F(UpdaterTest, file_getprop) {
@@ -272,7 +265,7 @@ TEST_F(UpdaterTest, file_getprop) {
     expect(nullptr, "file_getprop(\"arg1\", \"arg2\", \"arg3\")", kArgsParsingFailure);
 
     // File doesn't exist.
-    expect(nullptr, "file_getprop(\"/doesntexist\", \"key1\")", kFileGetPropFailure);
+    expect(nullptr, "file_getprop(\"/doesntexist\", \"key1\")", kFreadFailure);
 
     // Reject too large files (current limit = 65536).
     TemporaryFile temp_file1;
@@ -626,54 +619,100 @@ TEST_F(UpdaterTest, block_image_update_parsing_error) {
   RunBlockImageUpdate(false, entries, image_file_, "", kArgsParsingFailure);
 }
 
-TEST_F(UpdaterTest, block_image_update_patch_data) {
-  std::string src_content = std::string(4096, 'a') + std::string(4096, 'c');
-  std::string tgt_content = std::string(4096, 'b') + std::string(4096, 'd');
-
+// Generates the bsdiff of the given source and target images, and writes the result entries.
+// target_blocks specifies the block count to be written into the `bsdiff` command, which may be
+// different from the given target size in order to trigger overrun / underrun paths.
+static void GetEntriesForBsdiff(std::string_view source, std::string_view target,
+                                size_t target_blocks, PackageEntries* entries) {
   // Generate the patch data.
   TemporaryFile patch_file;
-  ASSERT_EQ(0,
-            bsdiff::bsdiff(reinterpret_cast<const uint8_t*>(src_content.data()), src_content.size(),
-                           reinterpret_cast<const uint8_t*>(tgt_content.data()), tgt_content.size(),
-                           patch_file.path, nullptr));
+  ASSERT_EQ(0, bsdiff::bsdiff(reinterpret_cast<const uint8_t*>(source.data()), source.size(),
+                              reinterpret_cast<const uint8_t*>(target.data()), target.size(),
+                              patch_file.path, nullptr));
   std::string patch_content;
   ASSERT_TRUE(android::base::ReadFileToString(patch_file.path, &patch_content));
 
   // Create the transfer list that contains a bsdiff.
-  std::string src_hash = get_sha1(src_content);
-  std::string tgt_hash = get_sha1(tgt_content);
+  std::string src_hash = GetSha1(source);
+  std::string tgt_hash = GetSha1(target);
+  size_t source_blocks = source.size() / 4096;
   std::vector<std::string> transfer_list{
     // clang-format off
     "4",
-    "2",
+    std::to_string(target_blocks),
     "0",
-    "2",
-    "stash " + src_hash + " 2,0,2",
-    android::base::StringPrintf("bsdiff 0 %zu %s %s 2,0,2 2 - %s:2,0,2", patch_content.size(),
-                                src_hash.c_str(), tgt_hash.c_str(), src_hash.c_str()),
-    "free " + src_hash,
+    "0",
+    // bsdiff patch_offset patch_length source_hash target_hash target_range source_block_count
+    // source_range
+    android::base::StringPrintf("bsdiff 0 %zu %s %s 2,0,%zu %zu 2,0,%zu", patch_content.size(),
+                                src_hash.c_str(), tgt_hash.c_str(), target_blocks, source_blocks,
+                                source_blocks),
     // clang-format on
   };
 
-  PackageEntries entries{
+  *entries = {
     { "new_data", "" },
     { "patch_data", patch_content },
     { "transfer_list", android::base::Join(transfer_list, '\n') },
   };
+}
 
-  ASSERT_TRUE(android::base::WriteStringToFile(src_content, image_file_));
+TEST_F(UpdaterTest, block_image_update_patch_data) {
+  // Both source and target images have 10 blocks.
+  std::string source =
+      std::string(4096, 'a') + std::string(4096, 'c') + std::string(4096 * 3, '\0');
+  std::string target =
+      std::string(4096, 'b') + std::string(4096, 'd') + std::string(4096 * 3, '\0');
+  ASSERT_TRUE(android::base::WriteStringToFile(source, image_file_));
 
+  PackageEntries entries;
+  GetEntriesForBsdiff(std::string_view(source).substr(0, 4096 * 2),
+                      std::string_view(target).substr(0, 4096 * 2), 2, &entries);
   RunBlockImageUpdate(false, entries, image_file_, "t");
 
   // The update_file should be patched correctly.
-  std::string updated_content;
-  ASSERT_TRUE(android::base::ReadFileToString(image_file_, &updated_content));
-  ASSERT_EQ(tgt_content, updated_content);
+  std::string updated;
+  ASSERT_TRUE(android::base::ReadFileToString(image_file_, &updated));
+  ASSERT_EQ(target, updated);
+}
+
+TEST_F(UpdaterTest, block_image_update_patch_overrun) {
+  // Both source and target images have 10 blocks.
+  std::string source =
+      std::string(4096, 'a') + std::string(4096, 'c') + std::string(4096 * 3, '\0');
+  std::string target =
+      std::string(4096, 'b') + std::string(4096, 'd') + std::string(4096 * 3, '\0');
+  ASSERT_TRUE(android::base::WriteStringToFile(source, image_file_));
+
+  // Provide one less block to trigger the overrun path.
+  PackageEntries entries;
+  GetEntriesForBsdiff(std::string_view(source).substr(0, 4096 * 2),
+                      std::string_view(target).substr(0, 4096 * 2), 1, &entries);
+
+  // The update should fail due to overrun.
+  RunBlockImageUpdate(false, entries, image_file_, "", kPatchApplicationFailure);
+}
+
+TEST_F(UpdaterTest, block_image_update_patch_underrun) {
+  // Both source and target images have 10 blocks.
+  std::string source =
+      std::string(4096, 'a') + std::string(4096, 'c') + std::string(4096 * 3, '\0');
+  std::string target =
+      std::string(4096, 'b') + std::string(4096, 'd') + std::string(4096 * 3, '\0');
+  ASSERT_TRUE(android::base::WriteStringToFile(source, image_file_));
+
+  // Provide one more block to trigger the overrun path.
+  PackageEntries entries;
+  GetEntriesForBsdiff(std::string_view(source).substr(0, 4096 * 2),
+                      std::string_view(target).substr(0, 4096 * 2), 3, &entries);
+
+  // The update should fail due to underrun.
+  RunBlockImageUpdate(false, entries, image_file_, "", kPatchApplicationFailure);
 }
 
 TEST_F(UpdaterTest, block_image_update_fail) {
   std::string src_content(4096 * 2, 'e');
-  std::string src_hash = get_sha1(src_content);
+  std::string src_hash = GetSha1(src_content);
   // Stash and free some blocks, then fail the update intentionally.
   std::vector<std::string> transfer_list{
     // clang-format off
@@ -699,7 +738,7 @@ TEST_F(UpdaterTest, block_image_update_fail) {
   RunBlockImageUpdate(false, entries, image_file_, "");
 
   // Updater generates the stash name based on the input file name.
-  std::string name_digest = get_sha1(image_file_);
+  std::string name_digest = GetSha1(image_file_);
   std::string stash_base = std::string(temp_stash_base_.path) + "/" + name_digest;
   ASSERT_EQ(0, access(stash_base.c_str(), F_OK));
   // Expect the stashed blocks to be freed.
@@ -803,9 +842,9 @@ TEST_F(UpdaterTest, last_command_update) {
   std::string block1(4096, '1');
   std::string block2(4096, '2');
   std::string block3(4096, '3');
-  std::string block1_hash = get_sha1(block1);
-  std::string block2_hash = get_sha1(block2);
-  std::string block3_hash = get_sha1(block3);
+  std::string block1_hash = GetSha1(block1);
+  std::string block2_hash = GetSha1(block2);
+  std::string block3_hash = GetSha1(block3);
 
   // Compose the transfer list to fail the first update.
   std::vector<std::string> transfer_list_fail{
@@ -871,8 +910,8 @@ TEST_F(UpdaterTest, last_command_update) {
 TEST_F(UpdaterTest, last_command_update_unresumable) {
   std::string block1(4096, '1');
   std::string block2(4096, '2');
-  std::string block1_hash = get_sha1(block1);
-  std::string block2_hash = get_sha1(block2);
+  std::string block1_hash = GetSha1(block1);
+  std::string block2_hash = GetSha1(block2);
 
   // Construct an unresumable update with source blocks mismatch.
   std::vector<std::string> transfer_list_unresumable{
@@ -908,9 +947,9 @@ TEST_F(UpdaterTest, last_command_verify) {
   std::string block1(4096, '1');
   std::string block2(4096, '2');
   std::string block3(4096, '3');
-  std::string block1_hash = get_sha1(block1);
-  std::string block2_hash = get_sha1(block2);
-  std::string block3_hash = get_sha1(block3);
+  std::string block1_hash = GetSha1(block1);
+  std::string block2_hash = GetSha1(block2);
+  std::string block3_hash = GetSha1(block3);
 
   std::vector<std::string> transfer_list_verify{
     // clang-format off
@@ -979,7 +1018,7 @@ class ResumableUpdaterTest : public testing::TestWithParam<size_t> {
 
     // Clear partition updated marker if any.
     std::string updated_marker{ temp_stash_base_.path };
-    updated_marker += "/" + get_sha1(image_temp_file_.path) + ".UPDATED";
+    updated_marker += "/" + GetSha1(image_temp_file_.path) + ".UPDATED";
     ASSERT_TRUE(android::base::RemoveFileIfExists(updated_marker));
   }
 
@@ -1010,10 +1049,10 @@ static std::vector<std::string> GenerateTransferList() {
   std::string i(4096, 'i');
   std::string zero(4096, '\0');
 
-  std::string a_hash = get_sha1(a);
-  std::string b_hash = get_sha1(b);
-  std::string c_hash = get_sha1(c);
-  std::string e_hash = get_sha1(e);
+  std::string a_hash = GetSha1(a);
+  std::string b_hash = GetSha1(b);
+  std::string c_hash = GetSha1(c);
+  std::string e_hash = GetSha1(e);
 
   auto loc = [](const std::string& range_text) {
     std::vector<std::string> pieces = android::base::Split(range_text, "-");
@@ -1034,8 +1073,8 @@ static std::vector<std::string> GenerateTransferList() {
   // patch 1: "b d c" -> "g"
   TemporaryFile patch_file_bdc_g;
   std::string bdc = b + d + c;
-  std::string bdc_hash = get_sha1(bdc);
-  std::string g_hash = get_sha1(g);
+  std::string bdc_hash = GetSha1(bdc);
+  std::string g_hash = GetSha1(g);
   CHECK_EQ(0, bsdiff::bsdiff(reinterpret_cast<const uint8_t*>(bdc.data()), bdc.size(),
                              reinterpret_cast<const uint8_t*>(g.data()), g.size(),
                              patch_file_bdc_g.path, nullptr));
@@ -1045,9 +1084,9 @@ static std::vector<std::string> GenerateTransferList() {
   // patch 2: "a b c d" -> "d c b"
   TemporaryFile patch_file_abcd_dcb;
   std::string abcd = a + b + c + d;
-  std::string abcd_hash = get_sha1(abcd);
+  std::string abcd_hash = GetSha1(abcd);
   std::string dcb = d + c + b;
-  std::string dcb_hash = get_sha1(dcb);
+  std::string dcb_hash = GetSha1(dcb);
   CHECK_EQ(0, bsdiff::bsdiff(reinterpret_cast<const uint8_t*>(abcd.data()), abcd.size(),
                              reinterpret_cast<const uint8_t*>(dcb.data()), dcb.size(),
                              patch_file_abcd_dcb.path, nullptr));

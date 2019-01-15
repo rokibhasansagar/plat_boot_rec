@@ -17,6 +17,8 @@
 #ifndef _RECOVERY_VERIFIER_H
 #define _RECOVERY_VERIFIER_H
 
+#include <stdint.h>
+
 #include <functional>
 #include <memory>
 #include <vector>
@@ -68,7 +70,19 @@ struct Certificate {
 int verify_file(const unsigned char* addr, size_t length, const std::vector<Certificate>& keys,
                 const std::function<void(float)>& set_progress = nullptr);
 
-bool load_keys(const char* filename, std::vector<Certificate>& certs);
+// Checks that the RSA key has a modulus of 2048 bits long, and public exponent is 3 or 65537.
+bool CheckRSAKey(const std::unique_ptr<RSA, RSADeleter>& rsa);
+
+// Checks that the field size of the curve for the EC key is 256 bits.
+bool CheckECKey(const std::unique_ptr<EC_KEY, ECKEYDeleter>& ec_key);
+
+// Parses a PEM-encoded x509 certificate from the given buffer and saves it into |cert|. Returns
+// false if there is a parsing failure or the signature's encryption algorithm is not supported.
+bool LoadCertificateFromBuffer(const std::vector<uint8_t>& pem_content, Certificate* cert);
+
+// Iterates over the zip entries with the suffix "x509.pem" and returns a list of recognized
+// certificates. Returns an empty list if we fail to parse any of the entries.
+std::vector<Certificate> LoadKeysFromZipfile(const std::string& zip_name);
 
 #define VERIFY_SUCCESS        0
 #define VERIFY_FAILURE        1

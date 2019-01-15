@@ -23,6 +23,7 @@
 
 #include <functional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "adb.h"
@@ -33,29 +34,29 @@
 #include "sysdeps.h"
 
 static void sideload_host_service(unique_fd sfd, const std::string& args) {
-    int file_size;
-    int block_size;
-    if (sscanf(args.c_str(), "%d:%d", &file_size, &block_size) != 2) {
-        printf("bad sideload-host arguments: %s\n", args.c_str());
-        exit(1);
-    }
+  int64_t file_size;
+  int block_size;
+  if ((sscanf(args.c_str(), "%" SCNd64 ":%d", &file_size, &block_size) != 2) || file_size <= 0 ||
+      block_size <= 0) {
+    printf("bad sideload-host arguments: %s\n", args.c_str());
+    exit(1);
+  }
 
-    printf("sideload-host file size %d block size %d\n", file_size, block_size);
+  printf("sideload-host file size %" PRId64 " block size %d\n", file_size, block_size);
 
-    int result = run_adb_fuse(sfd, file_size, block_size);
+  int result = run_adb_fuse(sfd, file_size, block_size);
 
-    printf("sideload_host finished\n");
-    exit(result == 0 ? 0 : 1);
+  printf("sideload_host finished\n");
+  exit(result == 0 ? 0 : 1);
 }
 
-unique_fd daemon_service_to_fd(const char* name, atransport* /* transport */) {
-  if (!strncmp(name, "sideload:", 9)) {
-    // this exit status causes recovery to print a special error
-    // message saying to use a newer adb (that supports
-    // sideload-host).
+unique_fd daemon_service_to_fd(std::string_view name, atransport* /* transport */) {
+  if (name.starts_with("sideload:")) {
+    // This exit status causes recovery to print a special error message saying to use a newer adb
+    // (that supports sideload-host).
     exit(3);
-  } else if (!strncmp(name, "sideload-host:", 14)) {
-    std::string arg(name + 14);
+  } else if (name.starts_with("sideload-host:")) {
+    std::string arg(name.substr(strlen("sideload-host:")));
     return create_service_thread("sideload-host",
                                  std::bind(sideload_host_service, std::placeholders::_1, arg));
   }

@@ -46,7 +46,7 @@ static const std::string LAST_LOG_FILTER = "recovery/last_log";
 // fopen(3)'s the given file, by mounting volumes and making parent dirs as necessary. Returns the
 // file pointer, or nullptr on error.
 static FILE* fopen_path(const std::string& path, const char* mode) {
-  if (ensure_path_mounted(path.c_str()) != 0) {
+  if (ensure_path_mounted(path) != 0) {
     LOG(ERROR) << "Can't mount " << path;
     return nullptr;
   }
@@ -221,6 +221,7 @@ void copy_logs(bool modified_flash, bool has_cache) {
   chown(LAST_KMSG_FILE, AID_SYSTEM, AID_SYSTEM);
   chmod(LAST_LOG_FILE, 0640);
   chmod(LAST_INSTALL_FILE, 0644);
+  chown(LAST_INSTALL_FILE, AID_SYSTEM, AID_SYSTEM);
   sync();
 }
 

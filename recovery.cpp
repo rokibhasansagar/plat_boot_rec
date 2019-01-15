@@ -286,9 +286,15 @@ static bool erase_volume(const char* volume) {
   return (result == 0);
 }
 
+// Sets the usb config to 'state'
+bool SetUsbConfig(const std::string& state) {
+  android::base::SetProperty("sys.usb.config", state);
+  return android::base::WaitForProperty("sys.usb.state", state);
+}
+
 // Returns the selected filename, or an empty string.
 static std::string browse_directory(const std::string& path, Device* device) {
-  ensure_path_mounted(path.c_str());
+  ensure_path_mounted(path);
 
   std::unique_ptr<DIR, decltype(&closedir)> d(opendir(path.c_str()), closedir);
   if (!d) {
@@ -363,7 +369,14 @@ static bool yes_no(Device* device, const char* question1, const char* question2)
 }
 
 static bool ask_to_wipe_data(Device* device) {
-  return yes_no(device, "Wipe all user data?", "  THIS CAN NOT BE UNDONE!");
+  std::vector<std::string> headers{ "Wipe all user data?", "  THIS CAN NOT BE UNDONE!" };
+  std::vector<std::string> items{ " Cancel", " Factory data reset" };
+
+  size_t chosen_item = ui->ShowPromptWipeDataConfirmationMenu(
+      headers, items,
+      std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
+
+  return (chosen_item == 1);
 }
 
 // Return true on success.
@@ -388,34 +401,38 @@ static bool wipe_data(Device* device) {
     return success;
 }
 
-static bool prompt_and_wipe_data(Device* device) {
+static InstallResult prompt_and_wipe_data(Device* device) {
   // Use a single string and let ScreenRecoveryUI handles the wrapping.
-  std::vector<std::string> headers{
+  std::vector<std::string> wipe_data_menu_headers{
     "Can't load Android system. Your data may be corrupt. "
     "If you continue to get this message, you may need to "
     "perform a factory data reset and erase all user data "
     "stored on this device.",
   };
   // clang-format off
-  std::vector<std::string> items {
+  std::vector<std::string> wipe_data_menu_items {
     "Try again",
     "Factory data reset",
   };
   // clang-format on
   for (;;) {
-    size_t chosen_item = ui->ShowMenu(
-        headers, items, 0, true,
+    size_t chosen_item = ui->ShowPromptWipeDataMenu(
+        wipe_data_menu_headers, wipe_data_menu_items,
         std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
-
     // If ShowMenu() returned RecoveryUI::KeyError::INTERRUPTED, WaitKey() was interrupted.
     if (chosen_item == static_cast<size_t>(RecoveryUI::KeyError::INTERRUPTED)) {
-      return false;
+      return INSTALL_KEY_INTERRUPTED;
     }
     if (chosen_item != 1) {
-      return true;  // Just reboot, no wipe; not a failure, user asked for it
+      return INSTALL_SUCCESS;  // Just reboot, no wipe; not a failure, user asked for it
     }
+
     if (ask_to_wipe_data(device)) {
-      return wipe_data(device);
+      if (wipe_data(device)) {
+        return INSTALL_SUCCESS;
+      } else {
+        return INSTALL_ERROR;
+      }
     }
   }
 }
@@ -508,34 +525,17 @@ static bool check_wipe_package(size_t wipe_package_size) {
         LOG(ERROR) << "Can't open wipe package : " << ErrorCodeString(err);
         return false;
     }
-    std::string metadata;
-    if (!read_metadata_from_package(zip, &metadata)) {
-        CloseArchive(zip);
-        return false;
+
+    std::map<std::string, std::string> metadata;
+    if (!ReadMetadataFromPackage(zip, &metadata)) {
+      LOG(ERROR) << "Failed to parse metadata in the zip file";
+      return false;
     }
+
+    int result = CheckPackageMetadata(metadata, OtaType::BRICK);
     CloseArchive(zip);
 
-    // Check metadata
-    std::vector<std::string> lines = android::base::Split(metadata, "\n");
-    bool ota_type_matched = false;
-    bool device_type_matched = false;
-    bool has_serial_number = false;
-    bool serial_number_matched = false;
-    for (const auto& line : lines) {
-        if (line == "ota-type=BRICK") {
-            ota_type_matched = true;
-        } else if (android::base::StartsWith(line, "pre-device=")) {
-            std::string device_type = line.substr(strlen("pre-device="));
-            std::string real_device_type = android::base::GetProperty("ro.build.product", "");
-            device_type_matched = (device_type == real_device_type);
-        } else if (android::base::StartsWith(line, "serialno=")) {
-            std::string serial_no = line.substr(strlen("serialno="));
-            std::string real_serial_no = android::base::GetProperty("ro.serialno", "");
-            has_serial_number = true;
-            serial_number_matched = (serial_no == real_serial_no);
-        }
-    }
-    return ota_type_matched && device_type_matched && (!has_serial_number || serial_number_matched);
+    return result == 0;
 }
 
 // Wipes the current A/B device, with a secure wipe of all the partitions in RECOVERY_WIPE.
@@ -578,7 +578,7 @@ static void choose_recovery_file(Device* device) {
           log_file += "." + std::to_string(i);
         }
 
-        if (ensure_path_mounted(log_file.c_str()) == 0 && access(log_file.c_str(), R_OK) == 0) {
+        if (ensure_path_mounted(log_file) == 0 && access(log_file.c_str(), R_OK) == 0) {
           entries.push_back(std::move(log_file));
         }
       };
@@ -842,14 +842,8 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
       }
       case Device::MOUNT_SYSTEM:
         // the system partition is mounted at /mnt/system
-        if (android::base::GetBoolProperty("ro.build.system_root_image", false)) {
-          if (ensure_path_mounted_at("/", "/mnt/system") != -1) {
-            ui->Print("Mounted /system.\n");
-          }
-        } else {
-          if (ensure_path_mounted_at("/system", "/mnt/system") != -1) {
-            ui->Print("Mounted /system.\n");
-          }
+        if (ensure_path_mounted_at(get_system_root(), "/mnt/system") != -1) {
+          ui->Print("Mounted /system.\n");
         }
         break;
 
@@ -1186,12 +1180,15 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
       status = INSTALL_ERROR;
     }
   } else if (should_prompt_and_wipe_data) {
+    // Trigger the logging to capture the cause, even if user chooses to not wipe data.
+    modified_flash = true;
+
     ui->ShowText(true);
     ui->SetBackground(RecoveryUI::ERROR);
-    if (!prompt_and_wipe_data(device)) {
-      status = INSTALL_ERROR;
+    status = prompt_and_wipe_data(device);
+    if (status != INSTALL_KEY_INTERRUPTED) {
+      ui->ShowText(false);
     }
-    ui->ShowText(false);
   } else if (should_wipe_cache) {
     if (!wipe_cache(false, device)) {
       status = INSTALL_ERROR;
