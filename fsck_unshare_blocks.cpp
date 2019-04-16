@@ -34,9 +34,8 @@
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/unique_fd.h>
-#include <fstab/fstab.h>
 
-#include "roots.h"
+#include "otautil/roots.h"
 
 static constexpr const char* SYSTEM_E2FSCK_BIN = "/system/bin/e2fsck_static";
 static constexpr const char* TMP_E2FSCK_BIN = "/tmp/e2fsck.bin";
