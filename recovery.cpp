@@ -18,11 +18,9 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <linux/fs.h>
 #include <linux/input.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,8 +28,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -42,12 +40,12 @@
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include <android-base/unique_fd.h>
-#include <bootloader_message/bootloader_message.h>
 #include <cutils/properties.h> /* for property_list */
+#include <fs_mgr/roots.h>
 #include <healthhalutils/HealthHalUtils.h>
 #include <ziparchive/zip_archive.h>
 
+#include "bootloader_message/bootloader_message.h"
 #include "common.h"
 #include "fsck_unshare_blocks.h"
 #include "install/adb_install.h"
@@ -55,6 +53,7 @@
 #include "install/install.h"
 #include "install/package.h"
 #include "install/wipe_data.h"
+#include "install/wipe_device.h"
 #include "otautil/error_code.h"
 #include "otautil/logging.h"
 #include "otautil/paths.h"
@@ -115,12 +114,12 @@ const char* reason = nullptr;
  * 3. main system reboots into recovery
  * 4. get_args() writes BCB with "boot-recovery" and "--update_package=..."
  *    -- after this, rebooting will attempt to reinstall the update --
- * 5. install_package() attempts to install the update
+ * 5. InstallPackage() attempts to install the update
  *    NOTE: the package install must itself be restartable from any point
  * 6. finish_recovery() erases BCB
  *    -- after this, rebooting will (try to) restart the main system --
  * 7. ** if install failed **
- *    7a. prompt_and_wait() shows an error icon and waits for the user
+ *    7a. PromptAndWait() shows an error icon and waits for the user
  *    7b. the user reboots (pulling the battery, etc) into the main system
  */
 
@@ -221,165 +220,6 @@ static InstallResult prompt_and_wipe_data(Device* device) {
   }
 }
 
-// Secure-wipe a given partition. It uses BLKSECDISCARD, if supported. Otherwise, it goes with
-// BLKDISCARD (if device supports BLKDISCARDZEROES) or BLKZEROOUT.
-static bool secure_wipe_partition(const std::string& partition) {
-  android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(partition.c_str(), O_WRONLY)));
-  if (fd == -1) {
-    PLOG(ERROR) << "Failed to open \"" << partition << "\"";
-    return false;
-  }
-
-  uint64_t range[2] = { 0, 0 };
-  if (ioctl(fd, BLKGETSIZE64, &range[1]) == -1 || range[1] == 0) {
-    PLOG(ERROR) << "Failed to get partition size";
-    return false;
-  }
-  LOG(INFO) << "Secure-wiping \"" << partition << "\" from " << range[0] << " to " << range[1];
-
-  LOG(INFO) << "  Trying BLKSECDISCARD...";
-  if (ioctl(fd, BLKSECDISCARD, &range) == -1) {
-    PLOG(WARNING) << "  Failed";
-
-    // Use BLKDISCARD if it zeroes out blocks, otherwise use BLKZEROOUT.
-    unsigned int zeroes;
-    if (ioctl(fd, BLKDISCARDZEROES, &zeroes) == 0 && zeroes != 0) {
-      LOG(INFO) << "  Trying BLKDISCARD...";
-      if (ioctl(fd, BLKDISCARD, &range) == -1) {
-        PLOG(ERROR) << "  Failed";
-        return false;
-      }
-    } else {
-      LOG(INFO) << "  Trying BLKZEROOUT...";
-      if (ioctl(fd, BLKZEROOUT, &range) == -1) {
-        PLOG(ERROR) << "  Failed";
-        return false;
-      }
-    }
-  }
-
-  LOG(INFO) << "  Done";
-  return true;
-}
-
-static std::unique_ptr<Package> ReadWipePackage(size_t wipe_package_size) {
-  if (wipe_package_size == 0) {
-    LOG(ERROR) << "wipe_package_size is zero";
-    return nullptr;
-  }
-
-  std::string wipe_package;
-  std::string err_str;
-  if (!read_wipe_package(&wipe_package, wipe_package_size, &err_str)) {
-    PLOG(ERROR) << "Failed to read wipe package" << err_str;
-    return nullptr;
-  }
-
-  return Package::CreateMemoryPackage(
-      std::vector<uint8_t>(wipe_package.begin(), wipe_package.end()), nullptr);
-}
-
-// Checks if the wipe package matches expectation. If the check passes, reads the list of
-// partitions to wipe from the package. Checks include
-// 1. verify the package.
-// 2. check metadata (ota-type, pre-device and serial number if having one).
-static bool CheckWipePackage(Package* wipe_package) {
-  if (!verify_package(wipe_package, ui)) {
-    LOG(ERROR) << "Failed to verify package";
-    return false;
-  }
-
-  ZipArchiveHandle zip = wipe_package->GetZipArchiveHandle();
-  if (!zip) {
-    LOG(ERROR) << "Failed to get ZipArchiveHandle";
-    return false;
-  }
-
-  std::map<std::string, std::string> metadata;
-  if (!ReadMetadataFromPackage(zip, &metadata)) {
-    LOG(ERROR) << "Failed to parse metadata in the zip file";
-    return false;
-  }
-
-  return CheckPackageMetadata(metadata, OtaType::BRICK) == 0;
-}
-
-std::vector<std::string> GetWipePartitionList(Package* wipe_package) {
-  ZipArchiveHandle zip = wipe_package->GetZipArchiveHandle();
-  if (!zip) {
-    LOG(ERROR) << "Failed to get ZipArchiveHandle";
-    return {};
-  }
-
-  static constexpr const char* RECOVERY_WIPE_ENTRY_NAME = "recovery.wipe";
-
-  std::string partition_list_content;
-  ZipString path(RECOVERY_WIPE_ENTRY_NAME);
-  ZipEntry entry;
-  if (FindEntry(zip, path, &entry) == 0) {
-    uint32_t length = entry.uncompressed_length;
-    partition_list_content = std::string(length, '\0');
-    if (auto err = ExtractToMemory(
-            zip, &entry, reinterpret_cast<uint8_t*>(partition_list_content.data()), length);
-        err != 0) {
-      LOG(ERROR) << "Failed to extract " << RECOVERY_WIPE_ENTRY_NAME << ": "
-                 << ErrorCodeString(err);
-      return {};
-    }
-  } else {
-    LOG(INFO) << "Failed to find " << RECOVERY_WIPE_ENTRY_NAME
-              << ", falling back to use the partition list on device.";
-
-    static constexpr const char* RECOVERY_WIPE_ON_DEVICE = "/etc/recovery.wipe";
-    if (!android::base::ReadFileToString(RECOVERY_WIPE_ON_DEVICE, &partition_list_content)) {
-      PLOG(ERROR) << "failed to read \"" << RECOVERY_WIPE_ON_DEVICE << "\"";
-      return {};
-    }
-  }
-
-  std::vector<std::string> result;
-  std::vector<std::string> lines = android::base::Split(partition_list_content, "\n");
-  for (const std::string& line : lines) {
-    std::string partition = android::base::Trim(line);
-    // Ignore '#' comment or empty lines.
-    if (android::base::StartsWith(partition, "#") || partition.empty()) {
-      continue;
-    }
-    result.push_back(line);
-  }
-
-  return result;
-}
-
-// Wipes the current A/B device, with a secure wipe of all the partitions in RECOVERY_WIPE.
-static bool wipe_ab_device(size_t wipe_package_size) {
-  ui->SetBackground(RecoveryUI::ERASING);
-  ui->SetProgressType(RecoveryUI::INDETERMINATE);
-
-  auto wipe_package = ReadWipePackage(wipe_package_size);
-  if (!wipe_package) {
-    LOG(ERROR) << "Failed to open wipe package";
-    return false;
-  }
-
-  if (!CheckWipePackage(wipe_package.get())) {
-    LOG(ERROR) << "Failed to verify wipe package";
-    return false;
-  }
-
-  auto partition_list = GetWipePartitionList(wipe_package.get());
-  if (partition_list.empty()) {
-    LOG(ERROR) << "Empty wipe ab partition list";
-    return false;
-  }
-
-  for (const auto& partition : partition_list) {
-    // Proceed anyway even if it fails to wipe some partition.
-    secure_wipe_partition(partition);
-  }
-  return true;
-}
-
 static void choose_recovery_file(Device* device) {
   std::vector<std::string> entries;
   if (has_cache) {
@@ -473,20 +313,30 @@ static void run_graphics_test() {
   ui->ShowText(true);
 }
 
-// Returns REBOOT, SHUTDOWN, or REBOOT_BOOTLOADER. Returning NO_ACTION means to take the default,
-// which is to reboot or shutdown depending on if the --shutdown_after flag was passed to recovery.
-static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
+// Shows the recovery UI and waits for user input. Returns one of the device builtin actions, such
+// as REBOOT, SHUTDOWN, or REBOOT_BOOTLOADER. Returning NO_ACTION means to take the default, which
+// is to reboot or shutdown depending on if the --shutdown_after flag was passed to recovery.
+static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status) {
   for (;;) {
     finish_recovery();
     switch (status) {
       case INSTALL_SUCCESS:
       case INSTALL_NONE:
+      case INSTALL_SKIPPED:
+      case INSTALL_RETRY:
+      case INSTALL_KEY_INTERRUPTED:
         ui->SetBackground(RecoveryUI::NO_COMMAND);
         break;
 
       case INSTALL_ERROR:
       case INSTALL_CORRUPT:
         ui->SetBackground(RecoveryUI::ERROR);
+        break;
+
+      case INSTALL_REBOOT:
+        // All the reboots should have been handled prior to entering PromptAndWait() or immediately
+        // after installing a package.
+        LOG(FATAL) << "Invalid status code of INSTALL_REBOOT";
         break;
     }
     ui->SetProgressType(RecoveryUI::EMPTY);
@@ -506,14 +356,19 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
             : device->InvokeMenuItem(chosen_item);
 
     switch (chosen_action) {
+      case Device::REBOOT_FROM_FASTBOOT:    // Can not happen
+      case Device::SHUTDOWN_FROM_FASTBOOT:  // Can not happen
       case Device::NO_ACTION:
         break;
 
-      case Device::REBOOT:
-      case Device::SHUTDOWN:
-      case Device::REBOOT_BOOTLOADER:
       case Device::ENTER_FASTBOOT:
       case Device::ENTER_RECOVERY:
+      case Device::REBOOT:
+      case Device::REBOOT_BOOTLOADER:
+      case Device::REBOOT_FASTBOOT:
+      case Device::REBOOT_RECOVERY:
+      case Device::REBOOT_RESCUE:
+      case Device::SHUTDOWN:
         return chosen_action;
 
       case Device::WIPE_DATA:
@@ -537,14 +392,28 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
         if (!ui->IsTextVisible()) return Device::NO_ACTION;
         break;
       }
+
       case Device::APPLY_ADB_SIDELOAD:
-      case Device::APPLY_SDCARD: {
+      case Device::APPLY_SDCARD:
+      case Device::ENTER_RESCUE: {
         save_current_log = true;
-        bool adb = (chosen_action == Device::APPLY_ADB_SIDELOAD);
-        if (adb) {
-          status = apply_from_adb(ui);
+
+        bool adb = true;
+        Device::BuiltinAction reboot_action;
+        if (chosen_action == Device::ENTER_RESCUE) {
+          // Switch to graphics screen.
+          ui->ShowText(false);
+          status = ApplyFromAdb(device, true /* rescue_mode */, &reboot_action);
+        } else if (chosen_action == Device::APPLY_ADB_SIDELOAD) {
+          status = ApplyFromAdb(device, false /* rescue_mode */, &reboot_action);
         } else {
+          adb = false;
           status = ApplyFromSdcard(device, ui);
+        }
+
+        ui->Print("\nInstall from %s completed with status %d.\n", adb ? "ADB" : "SD card", status);
+        if (status == INSTALL_REBOOT) {
+          return reboot_action;
         }
 
         if (status != INSTALL_SUCCESS) {
@@ -553,8 +422,6 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
           copy_logs(save_current_log, has_cache, sehandle);
         } else if (!ui->IsTextVisible()) {
           return Device::NO_ACTION;  // reboot if logs aren't visible
-        } else {
-          ui->Print("\nInstall from %s complete.\n", adb ? "ADB" : "SD card");
         }
         break;
       }
@@ -573,8 +440,7 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
         break;
       }
       case Device::MOUNT_SYSTEM:
-        // the system partition is mounted at /mnt/system
-        if (ensure_path_mounted_at(get_system_root(), "/mnt/system") != -1) {
+        if (ensure_path_mounted_at(android::fs_mgr::GetSystemRoot(), "/mnt/system") != -1) {
           ui->Print("Mounted /system.\n");
         }
         break;
@@ -715,6 +581,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     { "locale", required_argument, nullptr, 0 },
     { "prompt_and_wipe_data", no_argument, nullptr, 0 },
     { "reason", required_argument, nullptr, 0 },
+    { "rescue", no_argument, nullptr, 0 },
     { "retry_count", required_argument, nullptr, 0 },
     { "security", no_argument, nullptr, 0 },
     { "show_text", no_argument, nullptr, 't' },
@@ -737,6 +604,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   size_t wipe_package_size = 0;
   bool sideload = false;
   bool sideload_auto_reboot = false;
+  bool rescue = false;
   bool just_exit = false;
   bool shutdown_after = false;
   bool fsck_unshare_blocks = false;
@@ -770,6 +638,8 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
           should_prompt_and_wipe_data = true;
         } else if (option == "reason") {
           reason = optarg;
+        } else if (option == "rescue") {
+          rescue = true;
         } else if (option == "retry_count") {
           android::base::ParseInt(optarg, &retry_count, 0);
         } else if (option == "security") {
@@ -832,7 +702,10 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
 
   ui->Print("Supported API: %d\n", kRecoveryApiVersion);
 
-  int status = INSTALL_SUCCESS;
+  InstallResult status = INSTALL_SUCCESS;
+  // next_action indicates the next target to reboot into upon finishing the install. It could be
+  // overridden to a different reboot target per user request.
+  Device::BuiltinAction next_action = shutdown_after ? Device::SHUTDOWN : Device::REBOOT;
 
   if (update_package != nullptr) {
     // It's not entirely true that we will modify the flash. But we want
@@ -859,7 +732,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
         set_retry_bootloader_message(retry_count + 1, args);
       }
 
-      status = install_package(update_package, should_wipe_cache, true, retry_count, ui);
+      status = InstallPackage(update_package, should_wipe_cache, true, retry_count, ui);
       if (status != INSTALL_SUCCESS) {
         ui->Print("Installation aborted.\n");
 
@@ -873,8 +746,8 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
           // Print retry count on screen.
           ui->Print("Retry attempt %d\n", retry_count);
 
-          // Reboot and retry the update
-          if (!reboot("reboot,recovery")) {
+          // Reboot back into recovery to retry the update.
+          if (!Reboot("recovery")) {
             ui->Print("Reboot failed\n");
           } else {
             while (true) {
@@ -912,25 +785,28 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
       status = INSTALL_ERROR;
     }
   } else if (should_wipe_ab) {
-    if (!wipe_ab_device(wipe_package_size)) {
+    if (!WipeAbDevice(device, wipe_package_size)) {
       status = INSTALL_ERROR;
     }
   } else if (sideload) {
-    // 'adb reboot sideload' acts the same as user presses key combinations
-    // to enter the sideload mode. When 'sideload-auto-reboot' is used, text
-    // display will NOT be turned on by default. And it will reboot after
-    // sideload finishes even if there are errors. Unless one turns on the
-    // text display during the installation. This is to enable automated
+    // 'adb reboot sideload' acts the same as user presses key combinations to enter the sideload
+    // mode. When 'sideload-auto-reboot' is used, text display will NOT be turned on by default. And
+    // it will reboot after sideload finishes even if there are errors. This is to enable automated
     // testing.
     save_current_log = true;
     if (!sideload_auto_reboot) {
       ui->ShowText(true);
     }
-    status = apply_from_adb(ui);
+    status = ApplyFromAdb(device, false /* rescue_mode */, &next_action);
     ui->Print("\nInstall from ADB complete (status: %d).\n", status);
     if (sideload_auto_reboot) {
+      status = INSTALL_REBOOT;
       ui->Print("Rebooting automatically.\n");
     }
+  } else if (rescue) {
+    save_current_log = true;
+    status = ApplyFromAdb(device, true /* rescue_mode */, &next_action);
+    ui->Print("\nInstall from ADB complete (status: %d).\n", status);
   } else if (fsck_unshare_blocks) {
     if (!do_fsck_unshare_blocks()) {
       status = INSTALL_ERROR;
@@ -953,23 +829,26 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     }
   }
 
-  Device::BuiltinAction after = shutdown_after ? Device::SHUTDOWN : Device::REBOOT;
-  // 1. If the recovery menu is visible, prompt and wait for commands.
-  // 2. If the state is INSTALL_NONE, wait for commands. (i.e. In user build, manually reboot into
-  //    recovery to sideload a package.)
-  // 3. sideload_auto_reboot is an option only available in user-debug build, reboot the device
-  //    without waiting.
-  // 4. In all other cases, reboot the device. Therefore, normal users will observe the device
-  //    reboot after it shows the "error" screen for 5s.
-  if ((status == INSTALL_NONE && !sideload_auto_reboot) || ui->IsTextVisible()) {
-    Device::BuiltinAction temp = prompt_and_wait(device, status);
-    if (temp != Device::NO_ACTION) {
-      after = temp;
+  // Determine the next action.
+  //  - If the state is INSTALL_REBOOT, device will reboot into the target as specified in
+  //    `next_action`.
+  //  - If the recovery menu is visible, prompt and wait for commands.
+  //  - If the state is INSTALL_NONE, wait for commands (e.g. in user build, one manually boots
+  //    into recovery to sideload a package or to wipe the device).
+  //  - In all other cases, reboot the device. Therefore, normal users will observe the device
+  //    rebooting a) immediately upon successful finish (INSTALL_SUCCESS); or b) an "error" screen
+  //    for 5s followed by an automatic reboot.
+  if (status != INSTALL_REBOOT) {
+    if (status == INSTALL_NONE || ui->IsTextVisible()) {
+      auto temp = PromptAndWait(device, status);
+      if (temp != Device::NO_ACTION) {
+        next_action = temp;
+      }
     }
   }
 
   // Save logs and clean up before rebooting or shutting down.
   finish_recovery();
 
-  return after;
+  return next_action;
 }

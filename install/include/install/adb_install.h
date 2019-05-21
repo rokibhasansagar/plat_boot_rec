@@ -16,6 +16,10 @@
 
 #pragma once
 
-#include <recovery_ui/ui.h>
+#include "install/install.h"
+#include "recovery_ui/device.h"
 
-int apply_from_adb(RecoveryUI* ui);
+// Applies a package via `adb sideload` or `adb rescue`. Returns the install result. When a reboot
+// has been requested, INSTALL_REBOOT will be the return value, with the reboot target set in
+// reboot_action.
+InstallResult ApplyFromAdb(Device* device, bool rescue_mode, Device::BuiltinAction* reboot_action);
