@@ -41,8 +41,8 @@
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <bootloader_message/bootloader_message.h>
-#include <cutils/android_reboot.h>
 #include <cutils/sockets.h>
+#include <fs_mgr/roots.h>
 #include <private/android_logger.h> /* private pmsg functions */
 #include <selinux/android.h>
 #include <selinux/label.h>
@@ -50,8 +50,8 @@
 
 #include "common.h"
 #include "fastboot/fastboot.h"
-#include "logging.h"
-#include "minadbd/minadbd.h"
+#include "install/wipe_data.h"
+#include "otautil/logging.h"
 #include "otautil/paths.h"
 #include "otautil/roots.h"
 #include "otautil/sysutil.h"
@@ -155,9 +155,11 @@ static std::vector<std::string> get_args(const int argc, char** const argv) {
   }
 
   // Finally, if no arguments were specified, check whether we should boot
-  // into fastboot.
+  // into fastboot or rescue mode.
   if (args.size() == 1 && boot_command == "boot-fastboot") {
     args.emplace_back("--fastboot");
+  } else if (args.size() == 1 && boot_command == "boot-rescue") {
+    args.emplace_back("--rescue");
   }
 
   return args;
@@ -322,16 +324,6 @@ int main(int argc, char** argv) {
   // Take action to refresh pmsg contents
   __android_log_pmsg_file_read(LOG_ID_SYSTEM, ANDROID_LOG_INFO, filter, logrotate, &do_rotate);
 
-  // If this binary is started with the single argument "--adbd", instead of being the normal
-  // recovery binary, it turns into kind of a stripped-down version of adbd that only supports the
-  // 'sideload' command.  Note this must be a real argument, not anything in the command file or
-  // bootloader control block; the only way recovery should be run with this argument is when it
-  // starts a copy of itself from the apply_from_adb() function.
-  if (argc == 2 && strcmp(argv[1], "--adbd") == 0) {
-    minadbd_main();
-    return 0;
-  }
-
   time_t start = time(nullptr);
 
   // redirect_stdio should be called only in non-sideload mode. Otherwise we may have two logger
@@ -383,7 +375,6 @@ int main(int argc, char** argv) {
     }
 
     if (locale.empty()) {
-      static constexpr const char* DEFAULT_LOCALE = "en-US";
       locale = DEFAULT_LOCALE;
     }
   }
@@ -433,6 +424,10 @@ int main(int argc, char** argv) {
     device->RemoveMenuItemForAction(Device::ENTER_FASTBOOT);
   }
 
+  if (!is_ro_debuggable()) {
+    device->RemoveMenuItemForAction(Device::ENTER_RESCUE);
+  }
+
   ui->SetBackground(RecoveryUI::NONE);
   if (show_text) ui->ShowText(true);
 
@@ -444,6 +439,8 @@ int main(int argc, char** argv) {
   if (!sehandle) {
     ui->Print("Warning: No file_contexts\n");
   }
+
+  SetLoggingSehandle(sehandle);
 
   std::atomic<Device::BuiltinAction> action;
   std::thread listener_thread(ListenRecoverySocket, ui, std::ref(action));
@@ -474,18 +471,49 @@ int main(int argc, char** argv) {
     switch (ret) {
       case Device::SHUTDOWN:
         ui->Print("Shutting down...\n");
-        android::base::SetProperty(ANDROID_RB_PROPERTY, "shutdown,");
+        Shutdown("recovery");
+        break;
+
+      case Device::SHUTDOWN_FROM_FASTBOOT:
+        ui->Print("Shutting down...\n");
+        Shutdown("fastboot");
         break;
 
       case Device::REBOOT_BOOTLOADER:
         ui->Print("Rebooting to bootloader...\n");
-        android::base::SetProperty(ANDROID_RB_PROPERTY, "reboot,bootloader");
+        Reboot("bootloader");
         break;
 
+      case Device::REBOOT_FASTBOOT:
+        ui->Print("Rebooting to recovery/fastboot...\n");
+        Reboot("fastboot");
+        break;
+
+      case Device::REBOOT_RECOVERY:
+        ui->Print("Rebooting to recovery...\n");
+        Reboot("recovery");
+        break;
+
+      case Device::REBOOT_RESCUE: {
+        // Not using `Reboot("rescue")`, as it requires matching support in kernel and/or
+        // bootloader.
+        bootloader_message boot = {};
+        strlcpy(boot.command, "boot-rescue", sizeof(boot.command));
+        std::string err;
+        if (!write_bootloader_message(boot, &err)) {
+          LOG(ERROR) << "Failed to write bootloader message: " << err;
+          // Stay under recovery on failure.
+          continue;
+        }
+        ui->Print("Rebooting to recovery/rescue...\n");
+        Reboot("recovery");
+        break;
+      }
+
       case Device::ENTER_FASTBOOT:
-        if (logical_partitions_mapped()) {
+        if (android::fs_mgr::LogicalPartitionsMapped()) {
           ui->Print("Partitions may be mounted - rebooting to enter fastboot.");
-          android::base::SetProperty(ANDROID_RB_PROPERTY, "reboot,fastboot");
+          Reboot("fastboot");
         } else {
           LOG(INFO) << "Entering fastboot";
           fastboot = true;
@@ -497,9 +525,19 @@ int main(int argc, char** argv) {
         fastboot = false;
         break;
 
+      case Device::REBOOT:
+        ui->Print("Rebooting...\n");
+        Reboot("recovery_menu");
+        break;
+
+      case Device::REBOOT_FROM_FASTBOOT:
+        ui->Print("Rebooting...\n");
+        Reboot("fastboot_menu");
+        break;
+
       default:
         ui->Print("Rebooting...\n");
-        reboot("reboot,");
+        Reboot("unknown" + std::to_string(ret));
         break;
     }
   }
