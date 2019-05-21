@@ -41,8 +41,8 @@
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <bootloader_message/bootloader_message.h>
-#include <cutils/android_reboot.h>
 #include <cutils/sockets.h>
+#include <fs_mgr/roots.h>
 #include <private/android_logger.h> /* private pmsg functions */
 #include <selinux/android.h>
 #include <selinux/label.h>
@@ -155,9 +155,11 @@ static std::vector<std::string> get_args(const int argc, char** const argv) {
   }
 
   // Finally, if no arguments were specified, check whether we should boot
-  // into fastboot.
+  // into fastboot or rescue mode.
   if (args.size() == 1 && boot_command == "boot-fastboot") {
     args.emplace_back("--fastboot");
+  } else if (args.size() == 1 && boot_command == "boot-rescue") {
+    args.emplace_back("--rescue");
   }
 
   return args;
@@ -373,7 +375,6 @@ int main(int argc, char** argv) {
     }
 
     if (locale.empty()) {
-      static constexpr const char* DEFAULT_LOCALE = "en-US";
       locale = DEFAULT_LOCALE;
     }
   }
@@ -423,6 +424,10 @@ int main(int argc, char** argv) {
     device->RemoveMenuItemForAction(Device::ENTER_FASTBOOT);
   }
 
+  if (!is_ro_debuggable()) {
+    device->RemoveMenuItemForAction(Device::ENTER_RESCUE);
+  }
+
   ui->SetBackground(RecoveryUI::NONE);
   if (show_text) ui->ShowText(true);
 
@@ -466,18 +471,49 @@ int main(int argc, char** argv) {
     switch (ret) {
       case Device::SHUTDOWN:
         ui->Print("Shutting down...\n");
-        android::base::SetProperty(ANDROID_RB_PROPERTY, "shutdown,");
+        Shutdown("recovery");
+        break;
+
+      case Device::SHUTDOWN_FROM_FASTBOOT:
+        ui->Print("Shutting down...\n");
+        Shutdown("fastboot");
         break;
 
       case Device::REBOOT_BOOTLOADER:
         ui->Print("Rebooting to bootloader...\n");
-        android::base::SetProperty(ANDROID_RB_PROPERTY, "reboot,bootloader");
+        Reboot("bootloader");
         break;
 
+      case Device::REBOOT_FASTBOOT:
+        ui->Print("Rebooting to recovery/fastboot...\n");
+        Reboot("fastboot");
+        break;
+
+      case Device::REBOOT_RECOVERY:
+        ui->Print("Rebooting to recovery...\n");
+        Reboot("recovery");
+        break;
+
+      case Device::REBOOT_RESCUE: {
+        // Not using `Reboot("rescue")`, as it requires matching support in kernel and/or
+        // bootloader.
+        bootloader_message boot = {};
+        strlcpy(boot.command, "boot-rescue", sizeof(boot.command));
+        std::string err;
+        if (!write_bootloader_message(boot, &err)) {
+          LOG(ERROR) << "Failed to write bootloader message: " << err;
+          // Stay under recovery on failure.
+          continue;
+        }
+        ui->Print("Rebooting to recovery/rescue...\n");
+        Reboot("recovery");
+        break;
+      }
+
       case Device::ENTER_FASTBOOT:
-        if (logical_partitions_mapped()) {
+        if (android::fs_mgr::LogicalPartitionsMapped()) {
           ui->Print("Partitions may be mounted - rebooting to enter fastboot.");
-          android::base::SetProperty(ANDROID_RB_PROPERTY, "reboot,fastboot");
+          Reboot("fastboot");
         } else {
           LOG(INFO) << "Entering fastboot";
           fastboot = true;
@@ -489,9 +525,19 @@ int main(int argc, char** argv) {
         fastboot = false;
         break;
 
+      case Device::REBOOT:
+        ui->Print("Rebooting...\n");
+        Reboot("recovery_menu");
+        break;
+
+      case Device::REBOOT_FROM_FASTBOOT:
+        ui->Print("Rebooting...\n");
+        Reboot("fastboot_menu");
+        break;
+
       default:
         ui->Print("Rebooting...\n");
-        reboot("reboot,");
+        Reboot("unknown" + std::to_string(ret));
         break;
     }
   }
