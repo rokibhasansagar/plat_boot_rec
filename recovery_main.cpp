@@ -471,12 +471,12 @@ int main(int argc, char** argv) {
     switch (ret) {
       case Device::SHUTDOWN:
         ui->Print("Shutting down...\n");
-        Shutdown("recovery");
+        Shutdown("userrequested,recovery");
         break;
 
       case Device::SHUTDOWN_FROM_FASTBOOT:
         ui->Print("Shutting down...\n");
-        Shutdown("fastboot");
+        Shutdown("userrequested,fastboot");
         break;
 
       case Device::REBOOT_BOOTLOADER:
@@ -527,12 +527,12 @@ int main(int argc, char** argv) {
 
       case Device::REBOOT:
         ui->Print("Rebooting...\n");
-        Reboot("recovery_menu");
+        Reboot("userrequested,recovery");
         break;
 
       case Device::REBOOT_FROM_FASTBOOT:
         ui->Print("Rebooting...\n");
-        Reboot("fastboot_menu");
+        Reboot("userrequested,fastboot");
         break;
 
       default:
