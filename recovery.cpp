@@ -49,7 +49,7 @@
 #include "common.h"
 #include "fsck_unshare_blocks.h"
 #include "install/adb_install.h"
-#include "install/fuse_sdcard_install.h"
+#include "install/fuse_install.h"
 #include "install/install.h"
 #include "install/package.h"
 #include "install/wipe_data.h"
@@ -84,6 +84,8 @@ const char* reason = nullptr;
  *
  * The arguments which may be supplied in the recovery.command file:
  *   --update_package=path - verify install an OTA package file
+ *   --install_with_fuse - install the update package with FUSE. This allows installation of large
+ *       packages on LP32 builds. Since the mmap will otherwise fail due to out of memory.
  *   --wipe_data - erase user data (and cache), then reboot
  *   --prompt_and_wipe_data - prompt the user that data is corrupt, with their consent erase user
  *       data (and cache), then reboot
@@ -408,7 +410,7 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
           status = ApplyFromAdb(device, false /* rescue_mode */, &reboot_action);
         } else {
           adb = false;
-          status = ApplyFromSdcard(device, ui);
+          status = ApplyFromSdcard(device);
         }
 
         ui->Print("\nInstall from %s completed with status %d.\n", adb ? "ADB" : "SD card", status);
@@ -577,6 +579,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   static constexpr struct option OPTIONS[] = {
     { "fastboot", no_argument, nullptr, 0 },
     { "fsck_unshare_blocks", no_argument, nullptr, 0 },
+    { "install_with_fuse", no_argument, nullptr, 0 },
     { "just_exit", no_argument, nullptr, 'x' },
     { "locale", required_argument, nullptr, 0 },
     { "prompt_and_wipe_data", no_argument, nullptr, 0 },
@@ -597,6 +600,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   };
 
   const char* update_package = nullptr;
+  bool install_with_fuse = false;  // memory map the update package by default.
   bool should_wipe_data = false;
   bool should_prompt_and_wipe_data = false;
   bool should_wipe_cache = false;
@@ -632,6 +636,8 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
         std::string option = OPTIONS[option_index].name;
         if (option == "fsck_unshare_blocks") {
           fsck_unshare_blocks = true;
+        } else if (option == "install_with_fuse") {
+          install_with_fuse = true;
         } else if (option == "locale" || option == "fastboot") {
           // Handled in recovery_main.cpp
         } else if (option == "prompt_and_wipe_data") {
@@ -732,7 +738,29 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
         set_retry_bootloader_message(retry_count + 1, args);
       }
 
-      status = InstallPackage(update_package, should_wipe_cache, true, retry_count, ui);
+      if (update_package[0] == '@') {
+        ensure_path_mounted(update_package + 1);
+      } else {
+        ensure_path_mounted(update_package);
+      }
+
+      if (install_with_fuse) {
+        LOG(INFO) << "Installing package " << update_package << " with fuse";
+        status = InstallWithFuseFromPath(update_package, ui);
+      } else if (auto memory_package = Package::CreateMemoryPackage(
+                     update_package,
+                     std::bind(&RecoveryUI::SetProgress, ui, std::placeholders::_1));
+                 memory_package != nullptr) {
+        status = InstallPackage(memory_package.get(), update_package, should_wipe_cache,
+                                retry_count, ui);
+      } else {
+        // We may fail to memory map the package on 32 bit builds for packages with 2GiB+ size.
+        // In such cases, we will try to install the package with fuse. This is not the default
+        // installation method because it introduces a layer of indirection from the kernel space.
+        LOG(WARNING) << "Failed to memory map package " << update_package
+                     << "; falling back to install with fuse";
+        status = InstallWithFuseFromPath(update_package, ui);
+      }
       if (status != INSTALL_SUCCESS) {
         ui->Print("Installation aborted.\n");
 
