@@ -110,7 +110,11 @@ static auto AdbInstallPackageHandler(RecoveryUI* ui, InstallResult* result) {
         break;
       }
     }
-    *result = InstallPackage(FUSE_SIDELOAD_HOST_PATHNAME, false, false, 0, ui);
+
+    auto package =
+        Package::CreateFilePackage(FUSE_SIDELOAD_HOST_PATHNAME,
+                                   std::bind(&RecoveryUI::SetProgress, ui, std::placeholders::_1));
+    *result = InstallPackage(package.get(), FUSE_SIDELOAD_HOST_PATHNAME, false, 0, ui);
     break;
   }
 
@@ -363,11 +367,13 @@ InstallResult ApplyFromAdb(Device* device, bool rescue_mode, Device::BuiltinActi
         "\n\nNow send the package you want to apply\n"
         "to the device with \"adb sideload <filename>\"...\n");
   } else {
-    ui->Print("\n\nWaiting for rescue commands...\n");
     command_map.emplace(MinadbdCommand::kWipeData, [&device]() {
       bool result = WipeData(device, false);
       return std::make_pair(result, true);
     });
+    command_map.emplace(MinadbdCommand::kNoOp, []() { return std::make_pair(true, true); });
+
+    ui->Print("\n\nWaiting for rescue commands...\n");
   }
 
   CreateMinadbdServiceAndExecuteCommands(ui, command_map, rescue_mode);
