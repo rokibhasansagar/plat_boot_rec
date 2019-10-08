@@ -42,11 +42,9 @@
 #include <android-base/strings.h>
 #include <cutils/properties.h> /* for property_list */
 #include <fs_mgr/roots.h>
-#include <healthhalutils/HealthHalUtils.h>
 #include <ziparchive/zip_archive.h>
 
 #include "bootloader_message/bootloader_message.h"
-#include "common.h"
 #include "fsck_unshare_blocks.h"
 #include "install/adb_install.h"
 #include "install/fuse_install.h"
@@ -54,13 +52,15 @@
 #include "install/package.h"
 #include "install/wipe_data.h"
 #include "install/wipe_device.h"
+#include "otautil/boot_state.h"
 #include "otautil/error_code.h"
-#include "otautil/logging.h"
 #include "otautil/paths.h"
-#include "otautil/roots.h"
 #include "otautil/sysutil.h"
 #include "recovery_ui/screen_ui.h"
 #include "recovery_ui/ui.h"
+#include "recovery_utils/battery_utils.h"
+#include "recovery_utils/logging.h"
+#include "recovery_utils/roots.h"
 
 static constexpr const char* COMMAND_FILE = "/cache/recovery/command";
 static constexpr const char* LAST_KMSG_FILE = "/cache/recovery/last_kmsg";
@@ -70,8 +70,6 @@ static constexpr const char* LOCALE_FILE = "/cache/recovery/last_locale";
 static constexpr const char* CACHE_ROOT = "/cache";
 
 static bool save_current_log = false;
-std::string stage;
-const char* reason = nullptr;
 
 /*
  * The recovery tool communicates with the main system through /cache files.
@@ -208,7 +206,8 @@ static InstallResult prompt_and_wipe_data(Device* device) {
     }
 
     if (ask_to_wipe_data(device)) {
-      bool convert_fbe = reason && strcmp(reason, "convert_fbe") == 0;
+      CHECK(device->GetReason().has_value());
+      bool convert_fbe = device->GetReason().value() == "convert_fbe";
       if (WipeData(device, convert_fbe)) {
         return INSTALL_SUCCESS;
       } else {
@@ -454,74 +453,17 @@ static void print_property(const char* key, const char* name, void* /* cookie */
   printf("%s=%s\n", key, name);
 }
 
-static bool is_battery_ok(int* required_battery_level) {
-  using android::hardware::health::V1_0::BatteryStatus;
-  using android::hardware::health::V2_0::get_health_service;
-  using android::hardware::health::V2_0::IHealth;
-  using android::hardware::health::V2_0::Result;
-  using android::hardware::health::V2_0::toString;
+static bool IsBatteryOk(int* required_battery_level) {
+  // GmsCore enters recovery mode to install package when having enough battery percentage.
+  // Normally, the threshold is 40% without charger and 20% with charger. So we check the battery
+  // level against a slightly lower limit.
+  constexpr int BATTERY_OK_PERCENTAGE = 20;
+  constexpr int BATTERY_WITH_CHARGER_OK_PERCENTAGE = 15;
 
-  android::sp<IHealth> health = get_health_service();
-
-  static constexpr int BATTERY_READ_TIMEOUT_IN_SEC = 10;
-  int wait_second = 0;
-  while (true) {
-    auto charge_status = BatteryStatus::UNKNOWN;
-
-    if (health == nullptr) {
-      LOG(WARNING) << "no health implementation is found, assuming defaults";
-    } else {
-      health
-          ->getChargeStatus([&charge_status](auto res, auto out_status) {
-            if (res == Result::SUCCESS) {
-              charge_status = out_status;
-            }
-          })
-          .isOk();  // should not have transport error
-    }
-
-    // Treat unknown status as charged.
-    bool charged = (charge_status != BatteryStatus::DISCHARGING &&
-                    charge_status != BatteryStatus::NOT_CHARGING);
-
-    Result res = Result::UNKNOWN;
-    int32_t capacity = INT32_MIN;
-    if (health != nullptr) {
-      health
-          ->getCapacity([&res, &capacity](auto out_res, auto out_capacity) {
-            res = out_res;
-            capacity = out_capacity;
-          })
-          .isOk();  // should not have transport error
-    }
-
-    LOG(INFO) << "charge_status " << toString(charge_status) << ", charged " << charged
-              << ", status " << toString(res) << ", capacity " << capacity;
-    // At startup, the battery drivers in devices like N5X/N6P take some time to load
-    // the battery profile. Before the load finishes, it reports value 50 as a fake
-    // capacity. BATTERY_READ_TIMEOUT_IN_SEC is set that the battery drivers are expected
-    // to finish loading the battery profile earlier than 10 seconds after kernel startup.
-    if (res == Result::SUCCESS && capacity == 50) {
-      if (wait_second < BATTERY_READ_TIMEOUT_IN_SEC) {
-        sleep(1);
-        wait_second++;
-        continue;
-      }
-    }
-    // If we can't read battery percentage, it may be a device without battery. In this
-    // situation, use 100 as a fake battery percentage.
-    if (res != Result::SUCCESS) {
-      capacity = 100;
-    }
-
-    // GmsCore enters recovery mode to install package when having enough battery percentage.
-    // Normally, the threshold is 40% without charger and 20% with charger. So we should check
-    // battery with a slightly lower limitation.
-    static constexpr int BATTERY_OK_PERCENTAGE = 20;
-    static constexpr int BATTERY_WITH_CHARGER_OK_PERCENTAGE = 15;
-    *required_battery_level = charged ? BATTERY_WITH_CHARGER_OK_PERCENTAGE : BATTERY_OK_PERCENTAGE;
-    return capacity >= *required_battery_level;
-  }
+  auto battery_info = GetBatteryInfo();
+  *required_battery_level =
+      battery_info.charging ? BATTERY_WITH_CHARGER_OK_PERCENTAGE : BATTERY_OK_PERCENTAGE;
+  return battery_info.capacity >= *required_battery_level;
 }
 
 // Set the retry count to |retry_count| in BCB.
@@ -635,12 +577,10 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
           fsck_unshare_blocks = true;
         } else if (option == "install_with_fuse") {
           install_with_fuse = true;
-        } else if (option == "locale" || option == "fastboot") {
+        } else if (option == "locale" || option == "fastboot" || option == "reason") {
           // Handled in recovery_main.cpp
         } else if (option == "prompt_and_wipe_data") {
           should_prompt_and_wipe_data = true;
-        } else if (option == "reason") {
-          reason = optarg;
         } else if (option == "rescue") {
           rescue = true;
         } else if (option == "retry_count") {
@@ -674,8 +614,8 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   }
   optind = 1;
 
-  printf("stage is [%s]\n", stage.c_str());
-  printf("reason is [%s]\n", reason);
+  printf("stage is [%s]\n", device->GetStage().value_or("").c_str());
+  printf("reason is [%s]\n", device->GetReason().value_or("").c_str());
 
   auto ui = device->GetUI();
 
@@ -684,7 +624,8 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
   ui->SetSystemUpdateText(security_update);
 
   int st_cur, st_max;
-  if (!stage.empty() && sscanf(stage.c_str(), "%d/%d", &st_cur, &st_max) == 2) {
+  if (!device->GetStage().has_value() &&
+      sscanf(device->GetStage().value().c_str(), "%d/%d", &st_cur, &st_max) == 2) {
     ui->SetStage(st_cur, st_max);
   }
 
@@ -715,12 +656,10 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     // to log the update attempt since update_package is non-NULL.
     save_current_log = true;
 
-    int required_battery_level;
-    if (retry_count == 0 && !is_battery_ok(&required_battery_level)) {
+    if (int required_battery_level; retry_count == 0 && !IsBatteryOk(&required_battery_level)) {
       ui->Print("battery capacity is not enough for installing package: %d%% needed\n",
                 required_battery_level);
-      // Log the error code to last_install when installation skips due to
-      // low battery.
+      // Log the error code to last_install when installation skips due to low battery.
       log_failure_code(kLowBattery, update_package);
       status = INSTALL_SKIPPED;
     } else if (retry_count == 0 && bootreason_in_blacklist()) {
@@ -790,7 +729,8 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     }
   } else if (should_wipe_data) {
     save_current_log = true;
-    bool convert_fbe = reason && strcmp(reason, "convert_fbe") == 0;
+    CHECK(device->GetReason().has_value());
+    bool convert_fbe = device->GetReason().value() == "convert_fbe";
     if (!WipeData(device, convert_fbe)) {
       status = INSTALL_ERROR;
     }
