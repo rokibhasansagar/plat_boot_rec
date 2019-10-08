@@ -48,17 +48,17 @@
 #include <selinux/label.h>
 #include <selinux/selinux.h>
 
-#include "common.h"
 #include "fastboot/fastboot.h"
 #include "install/wipe_data.h"
-#include "otautil/logging.h"
+#include "otautil/boot_state.h"
 #include "otautil/paths.h"
-#include "otautil/roots.h"
 #include "otautil/sysutil.h"
 #include "recovery.h"
 #include "recovery_ui/device.h"
 #include "recovery_ui/stub_ui.h"
 #include "recovery_ui/ui.h"
+#include "recovery_utils/logging.h"
+#include "recovery_utils/roots.h"
 
 static constexpr const char* COMMAND_FILE = "/cache/recovery/command";
 static constexpr const char* LOCALE_FILE = "/cache/recovery/last_locale";
@@ -80,11 +80,12 @@ static void UiLogger(android::base::LogId /* id */, android::base::LogSeverity s
   }
 }
 
+// Parses the command line argument from various sources; and reads the stage field from BCB.
 // command line args come from, in decreasing precedence:
 //   - the actual command line
 //   - the bootloader control block (one per line, after "recovery")
 //   - the contents of COMMAND_FILE (one per line)
-static std::vector<std::string> get_args(const int argc, char** const argv) {
+static std::vector<std::string> get_args(const int argc, char** const argv, std::string* stage) {
   CHECK_GT(argc, 0);
 
   bootloader_message boot = {};
@@ -94,7 +95,9 @@ static std::vector<std::string> get_args(const int argc, char** const argv) {
     // If fails, leave a zeroed bootloader_message.
     boot = {};
   }
-  stage = std::string(boot.stage);
+  if (stage) {
+    *stage = std::string(boot.stage);
+  }
 
   std::string boot_command;
   if (boot.command[0] != 0) {
@@ -331,12 +334,14 @@ int main(int argc, char** argv) {
 
   load_volume_table();
 
-  std::vector<std::string> args = get_args(argc, argv);
+  std::string stage;
+  std::vector<std::string> args = get_args(argc, argv, &stage);
   auto args_to_parse = StringVectorToNullTerminatedArray(args);
 
   static constexpr struct option OPTIONS[] = {
     { "fastboot", no_argument, nullptr, 0 },
     { "locale", required_argument, nullptr, 0 },
+    { "reason", required_argument, nullptr, 0 },
     { "show_text", no_argument, nullptr, 't' },
     { nullptr, 0, nullptr, 0 },
   };
@@ -344,6 +349,13 @@ int main(int argc, char** argv) {
   bool show_text = false;
   bool fastboot = false;
   std::string locale;
+  std::string reason;
+
+  // The code here is only interested in the options that signal the intent to start fastbootd or
+  // recovery. Unrecognized options are likely meant for recovery, which will be processed later in
+  // start_recovery(). Suppress the warnings for such -- even if some flags were indeed invalid, the
+  // code in start_recovery() will capture and report them.
+  opterr = 0;
 
   int arg;
   int option_index;
@@ -357,6 +369,8 @@ int main(int argc, char** argv) {
         std::string option = OPTIONS[option_index].name;
         if (option == "locale") {
           locale = optarg;
+        } else if (option == "reason") {
+          reason = optarg;
         } else if (option == "fastboot" &&
                    android::base::GetBoolProperty("ro.boot.dynamic_partitions", false)) {
           fastboot = true;
@@ -366,6 +380,7 @@ int main(int argc, char** argv) {
     }
   }
   optind = 1;
+  opterr = 1;
 
   if (locale.empty()) {
     if (HasCache()) {
@@ -412,6 +427,9 @@ int main(int argc, char** argv) {
       device->ResetUI(new StubRecoveryUI());
     }
   }
+
+  BootState boot_state(reason, stage);  // recovery_main owns the state of boot.
+  device->SetBootState(&boot_state);
   ui = device->GetUI();
 
   if (!HasCache()) {
