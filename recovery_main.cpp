@@ -51,14 +51,14 @@
 #include "fastboot/fastboot.h"
 #include "install/wipe_data.h"
 #include "otautil/boot_state.h"
-#include "otautil/logging.h"
 #include "otautil/paths.h"
-#include "otautil/roots.h"
 #include "otautil/sysutil.h"
 #include "recovery.h"
 #include "recovery_ui/device.h"
 #include "recovery_ui/stub_ui.h"
 #include "recovery_ui/ui.h"
+#include "recovery_utils/logging.h"
+#include "recovery_utils/roots.h"
 
 static constexpr const char* COMMAND_FILE = "/cache/recovery/command";
 static constexpr const char* LOCALE_FILE = "/cache/recovery/last_locale";
@@ -351,6 +351,12 @@ int main(int argc, char** argv) {
   std::string locale;
   std::string reason;
 
+  // The code here is only interested in the options that signal the intent to start fastbootd or
+  // recovery. Unrecognized options are likely meant for recovery, which will be processed later in
+  // start_recovery(). Suppress the warnings for such -- even if some flags were indeed invalid, the
+  // code in start_recovery() will capture and report them.
+  opterr = 0;
+
   int arg;
   int option_index;
   while ((arg = getopt_long(args_to_parse.size() - 1, args_to_parse.data(), "", OPTIONS,
@@ -374,6 +380,7 @@ int main(int argc, char** argv) {
     }
   }
   optind = 1;
+  opterr = 1;
 
   if (locale.empty()) {
     if (HasCache()) {
