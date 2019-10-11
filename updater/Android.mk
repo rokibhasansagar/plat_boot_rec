@@ -44,7 +44,7 @@ updater_common_static_libraries := \
     libziparchive \
     libz \
     libbase \
-    libcrypto \
+    libcrypto_static \
     libcrypto_utils \
     libcutils \
     libutils
