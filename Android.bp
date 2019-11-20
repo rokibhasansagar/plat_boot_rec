@@ -58,12 +58,16 @@ cc_defaults {
     ],
 
     shared_libs: [
+        "android.hardware.boot@1.0",
+        "android.hardware.boot@1.1",
         "libbase",
         "libbootloader_message",
         "libcrypto",
         "libcutils",
         "libfs_mgr",
+        "liblp",
         "liblog",
+        "libprotobuf-cpp-lite",
         "libziparchive",
     ],
 
@@ -73,6 +77,7 @@ cc_defaults {
         "libminui",
         "librecovery_utils",
         "libotautil",
+        "libsnapshot_nobinder",
     ],
 }
 
@@ -92,6 +97,14 @@ cc_library_static {
     shared_libs: [
         "librecovery_ui",
     ],
+}
+
+prebuilt_etc {
+    name: "init_recovery.rc",
+    filename: "init.rc",
+    src: "etc/init.rc",
+    sub_dir: "init/hw",
+    recovery: true,
 }
 
 cc_binary {
@@ -119,11 +132,13 @@ cc_binary {
 
     required: [
         "e2fsdroid.recovery",
+        "init_recovery.rc",
         "librecovery_ui_ext",
         "minadbd",
         "mke2fs.conf.recovery",
         "mke2fs.recovery",
         "recovery_deps",
+        "ueventd.rc.recovery",
     ],
 }
 
